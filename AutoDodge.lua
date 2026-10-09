@@ -1,1443 +1,4047 @@
---==============================================================
--- AUTO DODGE  PRODUCTION  (capability-aware, single-file)
---==============================================================
--- Client predictive dodge for Roblox. Primary: Humanoid.
--- Custom controllers via MovementAdapter. Honest capability model.
---
--- Flow: Config→Registry→Detection(budget)→Tracking/Fusion
---      →Prediction(+unc)→Risk→Planner(3D)→Validator→Executor
--- FSM: IDLE→OBSERVE→THREAT→EVAL→DODGE/PANIC→RECOVERY
---
--- StarterPlayer→StarterPlayerScripts (LocalScript)
--- Module: require(...):Start()  |  shared.AutoDodge
---==============================================================
+--[[
+	Dex++
+	Version 3.0
+	
+	Developed by Chillz
+	
+	Dex++ is a revival of Moon's Dex, made to fulfill Moon's Dex prophecy.
+]]
 
-local Players           = game:GetService("Players")
-local RunService        = game:GetService("RunService")
-local UserInputService  = game:GetService("UserInputService")
-local CollectionService = game:GetService("CollectionService")
-local Workspace         = game:GetService("Workspace")
+local selection
+local nodes = {}
 
-local IS_CLIENT = RunService:IsClient()
-local LocalPlayer = Players.LocalPlayer
+local oldgame = game
+local game = workspace.Parent
 
---==============================================================
--- CONFIG (schema-validated, restart-safe)
---==============================================================
-local DEFAULTS = {
-	ENABLED = true, START_ENABLED = true, SHOW_UI = true, DEBUG = false,
-	MODE = "BALANCED", LANGUAGE = "ru",
-	THINK_RATE = 0.033, THINK_RATE_MIN = 0.022, THINK_RATE_MAX = 0.08,
-	HORIZON = 0.85, STEP = 0.06, MIN_STEP = 0.025,
-	MARGIN = 2.8, TRIGGER_TIME = 0.42, PANIC_TIME = 0.22,
-	HOLD_TIME = 0.30, RECOVERY_TIME = 0.32, COMBO_WATCH = 0.45,
-	COMMIT_TIME = 0.10, PANIC_COMMIT_TIME = 0.05,
-	SWITCH_GAIN = 0.35, HYSTERESIS = 0.22, DEAD_ZONE = 0.12,
-	VALIDATE_ACTIONS = true, VALIDATE_LOOKAHEAD = 0.16,
-	DETECT_RADIUS = 55, MAX_THREATS = 14, NEAR_CACHE = 22,
-	PERF_BUDGET_MS = 3.5, DETECTOR_BUDGET_MS = 2.0,
-	MANUAL_BIAS = 1.45, SMOOTH = 20,
-	ENABLE_SPEED_BOOST = true, SPEED_MULT = 1.22, SPEED_BOOST_CAP = 1.45,
-	DASH_ENABLED = true, DASH_SPEED = 72, DASH_TIME = 0.14,
-	DASH_COOLDOWN = 0.85, DASH_NEED = 0.35, DASH_GAIN = 1.1, DASH_IN_AIR = false,
-	DASH_HOOK = nil, JUMP_COOLDOWN = 0.55,
-	WALL_RAY = 5.5, LEDGE_CHECK = true, LEDGE_DEPTH = 6,
-	DETECT_BEAMS = true, DETECT_ATTACHMENTS = true, DETECT_AIM = true,
-	DETECT_PROJECTILES = true, DETECT_ACTORS = true, DETECT_PARTS = true,
-	USE_ACTION_ANIMATIONS = false,
-	AUTO_LEARN = true, LEARN_MIN_HITS = 3, LEARN_COOLDOWN = 0.15,
-	LEARN_EARLY = 0.05, LEARN_LATE = 0.12, LEARN_TAGS_ON_HIT = false,
-	COMBO_LEARN = true, COMBO_MIN_OBS = 3, COMBO_DECAY = 0.92,
-	THREAT_CONFIDENCE_MIN = 0.32, SOFT_TEAM_IGNORE = true, SOFT_NAME_IGNORE = true,
-	PING_COMP = true, REACTION_LAG = 0.04,
-	PLANNER_3D = true, ADAPTIVE_SAMPLE = true,
-	COARSE_DIRS = 12, REFINE_DIRS = 8, REFINE_SPREAD = 18,
-	TOGGLE_KEY = Enum.KeyCode.K, PAUSE_KEY = Enum.KeyCode.LeftAlt,
-	DANGER_TAGS = {"Danger","Hitbox","Attack","Projectile","Hazard","Damage","Blade"},
-	DANGER_NAME_WORDS = {"hitbox","hurtbox","slash","swing","blade","projectile","bullet","missile","beam","laser","explosion","aoe","hazard","danger","spike"},
-	IGNORE_NAME_WORDS = {"effect","vfx","sfx","trail_cosmetic","highlight","billboard","gui","decal","texture"},
-	GUN_TOOL_WORDS = {"gun","rifle","pistol","blaster","bow","crossbow","launcher"},
-	CUSTOM_ROOT_NAMES = {"HumanoidRootPart","RootPart","Root","PrimaryPart"},
-	ATTACK_ANIMATION_IDS = {}, LEARNED_SEED = {}, KEYFRAME_SEED = {},
-	IsThreatHook = nil, FilterThreatHook = nil, ActionHook = nil,
-	MovementAdapter = nil, StateAdapter = nil,
-}
-local MODES = {
-	CALM = {MARGIN=2.2,TRIGGER_TIME=0.32,PANIC_TIME=0.16,DETECT_RADIUS=42,THREAT_CONFIDENCE_MIN=0.45,MANUAL_BIAS=1.8,SPEED_MULT=1.12,USE_ACTION_ANIMATIONS=false},
-	BALANCED = {},
-	PARANOID = {MARGIN=3.6,TRIGGER_TIME=0.55,PANIC_TIME=0.30,DETECT_RADIUS=70,THREAT_CONFIDENCE_MIN=0.22,MANUAL_BIAS=0.9,SPEED_MULT=1.32,USE_ACTION_ANIMATIONS=true,HOLD_TIME=0.38,HYSTERESIS=0.15},
-}
-local CFG, DEFAULT_CFG = {}, {}
-local function deepCopy(t)
-	if type(t)~="table" then return t end
-	local n={} for k,v in pairs(t) do n[k]=type(v)=="table" and deepCopy(v) or v end return n
-end
-local function applyDefaults() for k,v in pairs(DEFAULTS) do CFG[k]=type(v)=="table" and deepCopy(v) or v end end
-local function applyMode(name) local m=MODES[name or CFG.MODE]; if m then for k,v in pairs(m) do CFG[k]=v end end end
-local function finiteNumber(x,lo,hi,fb)
-	if type(x)~="number" or x~=x or x==math.huge or x==-math.huge then return fb end
-	if lo and x<lo then return lo end; if hi and x>hi then return hi end; return x
-end
-local function validateConfig()
-	CFG.THINK_RATE=finiteNumber(CFG.THINK_RATE,0.016,0.2,0.033)
-	CFG.HORIZON=finiteNumber(CFG.HORIZON,0.2,2.5,0.85)
-	CFG.STEP=finiteNumber(CFG.STEP,0.02,0.15,0.06)
-	CFG.MARGIN=finiteNumber(CFG.MARGIN,0.5,12,2.8)
-	CFG.TRIGGER_TIME=finiteNumber(CFG.TRIGGER_TIME,0.08,1.5,0.42)
-	CFG.PANIC_TIME=finiteNumber(CFG.PANIC_TIME,0.05,1.0,0.22)
-	CFG.DETECT_RADIUS=finiteNumber(CFG.DETECT_RADIUS,10,200,55)
-	CFG.MAX_THREATS=math.floor(finiteNumber(CFG.MAX_THREATS,4,40,14))
-	CFG.PERF_BUDGET_MS=finiteNumber(CFG.PERF_BUDGET_MS,1,12,3.5)
-	CFG.DETECTOR_BUDGET_MS=finiteNumber(CFG.DETECTOR_BUDGET_MS,0.5,8,2.0)
-	CFG.MANUAL_BIAS=finiteNumber(CFG.MANUAL_BIAS,0,4,1.45)
-	CFG.SMOOTH=finiteNumber(CFG.SMOOTH,4,60,20)
-	CFG.SPEED_MULT=finiteNumber(CFG.SPEED_MULT,1,2,1.22)
-	CFG.LEARN_MIN_HITS=math.floor(finiteNumber(CFG.LEARN_MIN_HITS,1,20,3))
-	CFG.THREAT_CONFIDENCE_MIN=finiteNumber(CFG.THREAT_CONFIDENCE_MIN,0.05,0.9,0.32)
-	CFG.HYSTERESIS=finiteNumber(CFG.HYSTERESIS,0.05,1.5,0.22)
-	CFG.REACTION_LAG=finiteNumber(CFG.REACTION_LAG,0,0.25,0.04)
-	if CFG.PANIC_TIME>CFG.TRIGGER_TIME then CFG.PANIC_TIME=CFG.TRIGGER_TIME*0.55 end
-end
-applyDefaults(); applyMode(CFG.MODE); validateConfig(); DEFAULT_CFG=deepCopy(CFG)
-
---==============================================================
--- MATH
---==============================================================
-local CAP, FAR, ZERO, UP = 8, 1e6, Vector3.zero, Vector3.yAxis
-local function clamp01(x) if x<0 then return 0 elseif x>1 then return 1 end return x end
-local function unit(v)
-	if not v then return ZERO end local m=v.Magnitude
-	if m<1e-5 or m~=m then return ZERO end return v/m
-end
-local function flat(v) return Vector3.new(v.X,0,v.Z) end
-local function safeUnit(v,fb) local u=unit(v); if u.Magnitude<0.05 then return fb or Vector3.new(0,0,-1) end return u end
-local function closestApproach(pA,vA,pB,vB)
-	local dp,dv=pA-pB,vA-vB; local a=dv:Dot(dv)
-	if a<1e-8 then return 0,dp.Magnitude end
-	local t=-dp:Dot(dv)/a; if t~=t or t<0 then t=0 end
-	return t,(dp+dv*t).Magnitude
-end
-local function travelAt(t,speed,lag,dash)
-	local tl=math.max(t-(lag or 0),0)
-	if dash and tl<=(dash.time or 0) then
-		return speed*math.min(t,lag or 0)+(dash.speed or speed)*math.min(tl,dash.time or 0)
-	end
-	return speed*math.max(t-(lag or 0),0)+speed*math.min(t,lag or 0)*0.35
-end
-local function containsToken(name,words)
-	if type(name)~="string" or name=="" or type(words)~="table" then return false end
-	local lower=string.lower(name)
-	local norm=string.gsub(lower,"(%l)(%u)","%1_%2"); norm=string.gsub(norm,"[^%a%d]+","_"); norm="_"..norm.."_"
-	for _,w in ipairs(words) do
-		if type(w)=="string" and #w>=2 then
-			local lw=string.lower(w)
-			if string.find(norm,"_"..lw.."_",1,true) then return true end
-			if #lw>=5 and string.find(lower,lw,1,true) then return true end
+cloneref = cloneref or function(ref)
+	if not getreg then return ref end
+	
+	local InstanceList
+	
+	local a = Instance.new("Part")
+	for _, c in pairs(getreg()) do
+		if type(c) == "table" and #c then
+			if rawget(c, "__mode") == "kvs" then
+				for d, e in pairs(c) do
+					if e == a then
+						InstanceList = c
+						break
+					end
+				end
+			end
 		end
 	end
-	return false
-end
-local function finiteVec(v)
-	if typeof(v)~="Vector3" then return false end
-	return v.X==v.X and v.Y==v.Y and v.Z==v.Z and math.abs(v.X)<1e6 and math.abs(v.Y)<1e6 and math.abs(v.Z)<1e6
-end
-local function runSelfTests()
-	local ok=true
-	local function check(n,c) if not c then warn("[AutoDodge] self-test FAIL:",n); ok=false end end
-	local t,d=closestApproach(Vector3.new(0,0,0),Vector3.new(10,0,0),Vector3.new(5,0,1),ZERO)
-	check("closestApproach",t>=0 and d<2); check("unit0",unit(ZERO).Magnitude<1e-6)
-	check("travelAt",travelAt(0.2,16,0.05)>0); check("finiteVec",finiteVec(Vector3.new(1,2,3)))
-	return ok
-end
-
---==============================================================
--- STATE / SESSION / FSM
---==============================================================
-local AutoDodgeModule = {}
-local running, sessionId, enabled = false, 0, true
-local FSM = {IDLE="IDLE",OBSERVE="OBSERVE",THREAT="THREAT",EVAL="EVAL",DODGE="DODGE",PANIC="PANIC",RECOVERY="RECOVERY",PAUSED="PAUSED",DISABLED="DISABLED"}
-local fsmState = FSM.IDLE
-local Character, Humanoid, Root, Move
-local baseSpeed, boosted, charScale = 16, false, 1
-local threats, active, panic = {}, false, false
-local targetDir, curDir, finalDir = ZERO, ZERO, ZERO
-local dodgeUntil, lastChoose, lastThink = 0, 0, 0
-local lastJump, lastDash = -1e9, -1e9
-local dashDir, dashUntil, dashWas = ZERO, 0, false
-local jumpPlanned, recoveryUntil, recoveryDir = false, 0, ZERO
-local lastManual, lastManualTime = ZERO, 0
-local holdPause, suspendHeld, hardPauseUntil, busyUntil = false, false, 0, 0
-local toolDown, lastStats = {}, {threats=0,tHit=nil}
-local lastDecision = {score=nil,worst=nil,reason="",rejected={}}
-local lastError, thinkAvg, perfLow, pingValue, lastPingAt = nil, 0, false, 0, 0
-local trackStore, learned, comboGraph = {}, {}, {}
-local lastLearnedAnim, lastLearnedAt, predictedNextAnim, predictedNextUntil = nil, -1e9, nil, 0
-local learnedCount = 0
-local flaggedParts, dynamicParts, beamThreats, attachmentThreats = {}, {}, {}, {}
-local actorCache, manualThreats, ownerCache = {}, {}, {}
-local rootConns, charConns, registryConns = {}, {}, {}
-local detectorState = {
-	actor={period=0.033,last=0,avgMs=0.3,fails=0},
-	projectile={period=0.033,last=0,avgMs=0.4,fails=0},
-	parts={period=0.05,last=0,avgMs=0.3,fails=0},
-	beam={period=0.08,last=0,avgMs=0.2,fails=0},
-	aim={period=0.1,last=0,avgMs=0.15,fails=0},
-	attachment={period=0.12,last=0,avgMs=0.15,fails=0},
-}
-local detectorSkip, lastDetectorMs = {}, {}
-local diagnostics = {detectorMs={},skipped={},threatsBySource={},plannerCandidates=0,chosen=nil,rejects={}}
-local gameCaps = {
-	ARCHETYPE="UNKNOWN",HAS_HUMANOID=true,HAS_DASH=true,HAS_JUMP=true,HAS_VELOCITY_CTRL=true,
-	HAS_ANIM_MARKERS=false,HAS_TAGS=false,HAS_PROJECTILES=false,HAS_BEAMS=false,
-	SPEED_OWNED_BY_GAME=false,CAN_MOVE=true,CAN_JUMP=true,CAN_DASH=true,
-}
-local TXT = {threats="угрозы",learned="выучено",on="ВКЛ",off="ВЫКЛ"}
-local rayParams, bootstrapDone, gui, hudLabel, toggleBtn = nil, false, nil, nil, nil
-
---==============================================================
--- MOVEMENT ADAPTER
---==============================================================
-local function humanoidAdapter()
-	return {
-		GetPosition=function() return Root and Root.Position or ZERO end,
-		GetVelocity=function() return Root and Root.AssemblyLinearVelocity or ZERO end,
-		GetMoveDirection=function() return Humanoid and Humanoid.MoveDirection or ZERO end,
-		GetSpeed=function() return Humanoid and Humanoid.WalkSpeed or baseSpeed end,
-		SetSpeed=function(s) if Humanoid and not gameCaps.SPEED_OWNED_BY_GAME then Humanoid.WalkSpeed=s end end,
-		Move=function(dir) if Humanoid and dir then Humanoid:Move(dir,false) end end,
-		Jump=function() if Humanoid then Humanoid.Jump=true end end,
-		CanJump=function()
-			if not Humanoid then return false end
-			local st=Humanoid:GetState()
-			return st~=Enum.HumanoidStateType.Freefall and st~=Enum.HumanoidStateType.Flying and st~=Enum.HumanoidStateType.Dead
-		end,
-		GetCFrame=function() return Root and Root.CFrame or CFrame.new() end,
-		GetLookVector=function() return Root and Root.CFrame.LookVector or Vector3.new(0,0,-1) end,
-		SupportsDash=function() return true end,
-		SupportsVelocity=function() return true end,
-		Dash=function(dir,speed)
-			if not Root or not dir then return end
-			local v=unit(dir)*speed
-			Root.AssemblyLinearVelocity=Vector3.new(v.X, Root.AssemblyLinearVelocity.Y, v.Z)
-		end,
-	}
-end
-local function validateAdapter(ad)
-	if type(ad)~="table" then return false end
-	for _,k in ipairs({"GetPosition","GetVelocity","Move","GetSpeed"}) do
-		if type(ad[k])~="function" then warn("[AutoDodge] adapter missing",k); return false end
-	end
-	return true
-end
-local function bindMovementAdapter(custom)
-	local base=humanoidAdapter()
-	if type(custom)=="table" then
-		for k,v in pairs(base) do if custom[k]==nil then custom[k]=v end end
-		Move=custom
-	else Move=base end
-end
-local function stateFlags(now)
-	local f={DEAD=false,INVULNERABLE=false,STUNNED=false,BUSY=false,CAN_MOVE=true,CAN_JUMP=true,CAN_DASH=true}
-	if Humanoid then
-		f.DEAD=Humanoid.Health<=0 or Humanoid:GetState()==Enum.HumanoidStateType.Dead
-		f.CAN_JUMP=Humanoid.FloorMaterial~=Enum.Material.Air or CFG.DASH_IN_AIR
-	end
-	if type(CFG.StateAdapter)=="function" then
-		local ok,ex=pcall(CFG.StateAdapter,Character,Humanoid,now)
-		if ok and type(ex)=="table" then for k,v in pairs(ex) do f[k]=v end end
-	end
-	f.BUSY=f.BUSY or now<busyUntil or holdPause or suspendHeld
-	for _,d in pairs(toolDown) do if d then f.BUSY=true break end end
-	f.CAN_MOVE=f.CAN_MOVE and gameCaps.CAN_MOVE and not f.DEAD
-	f.CAN_JUMP=f.CAN_JUMP and gameCaps.CAN_JUMP and not f.DEAD
-	f.CAN_DASH=f.CAN_DASH and gameCaps.CAN_DASH and CFG.DASH_ENABLED and not f.DEAD
-	return f
-end
-
---==============================================================
--- ROOT / SCALE
---==============================================================
-local function getRoot(model)
-	if not model then return nil end
-	local scores={}
-	local function add(part,conf) if part and part:IsA("BasePart") then scores[#scores+1]={part=part,conf=conf} end end
-	local hum=model:FindFirstChildOfClass("Humanoid")
-	if hum and hum.RootPart then add(hum.RootPart,1.0) end
-	if model.PrimaryPart then add(model.PrimaryPart,0.95) end
-	for _,n in ipairs(CFG.CUSTOM_ROOT_NAMES or {}) do
-		local risky=(n=="Hitbox" or n=="Body" or n=="Core" or n=="Main" or n=="Center")
-		add(model:FindFirstChild(n), risky and 0.45 or 0.85)
-	end
-	table.sort(scores,function(a,b) return a.conf>b.conf end)
-	return scores[1] and scores[1].part or nil
-end
-local function updateCharScale()
-	if not Root then charScale=1 return end
-	charScale=math.clamp(((Root.Size.X+Root.Size.Z)*0.5)/2.0, 0.6, 2.5)
-end
-local function marginOf(th)
-	local base=CFG.MARGIN*charScale
-	if th and th.uncertainty then base=base+th.uncertainty*0.5 end
-	return base
-end
-
---==============================================================
--- REGISTRY (event-driven)
---==============================================================
-local function classifyPart(part)
-	if not part or not part:IsA("BasePart") then return end
-	if containsToken(part.Name, CFG.IGNORE_NAME_WORDS) then return end
-	local danger=false
-	for _,tag in ipairs(CollectionService:GetTags(part)) do
-		if table.find(CFG.DANGER_TAGS,tag) then danger=true break end
-	end
-	if not danger then danger=containsToken(part.Name, CFG.DANGER_NAME_WORDS) end
-	if danger then flaggedParts[part]=true; gameCaps.HAS_TAGS=true
-	else dynamicParts[part]=true end
-end
-local function onDescendantAdded(obj)
-	if obj:IsA("BasePart") then classifyPart(obj)
-	elseif obj:IsA("Beam") or obj:IsA("Trail") then beamThreats[obj]=true; if obj:IsA("Beam") then gameCaps.HAS_BEAMS=true end
-	elseif obj:IsA("Attachment") then
-		local n=string.lower(obj.Name)
-		if string.find(n,"muzzle",1,true) or string.find(n,"fire",1,true) or string.find(n,"barrel",1,true) then
-			attachmentThreats[obj]=true
+	local f = {}
+	function f.invalidate(g)
+		if not InstanceList then
+			return
 		end
-	elseif obj:IsA("Model") then
-		local hum=obj:FindFirstChildOfClass("Humanoid")
-		if hum and obj~=Character then actorCache[obj]={hum=hum,root=getRoot(obj),last=0} end
-	end
-end
-local function onDescendantRemoving(obj)
-	flaggedParts[obj]=nil; dynamicParts[obj]=nil; beamThreats[obj]=nil; attachmentThreats[obj]=nil
-	if obj:IsA("Model") then actorCache[obj]=nil end
-end
-local function startRegistries()
-	for _,c in ipairs(registryConns) do pcall(function() c:Disconnect() end) end
-	table.clear(registryConns)
-	for _,obj in ipairs(Workspace:GetDescendants()) do
-		if obj:IsA("BasePart") or obj:IsA("Beam") or obj:IsA("Trail") or obj:IsA("Attachment") or obj:IsA("Model") then
-			onDescendantAdded(obj)
+		for b, c in pairs(InstanceList) do
+			if c == g then
+				InstanceList[b] = nil
+				return g
+			end
 		end
 	end
-	registryConns[#registryConns+1]=Workspace.DescendantAdded:Connect(onDescendantAdded)
-	registryConns[#registryConns+1]=Workspace.DescendantRemoving:Connect(onDescendantRemoving)
-	for _,tag in ipairs(CFG.DANGER_TAGS) do
-		registryConns[#registryConns+1]=CollectionService:GetInstanceAddedSignal(tag):Connect(function(inst)
-			if inst:IsA("BasePart") then flaggedParts[inst]=true; gameCaps.HAS_TAGS=true end
+	return f.invalidate
+end
+
+local EmbeddedModules = {
+["Console"] = function()
+--[[
+	Console Module
+]]
+-- Common Locals
+local Main,Lib,Apps,Settings -- Main Containers
+local Explorer, Properties, ScriptViewer, Notebook -- Major Apps
+local API,RMD,env,service,plr,create,createSimple -- Main Locals
+
+local function initDeps(data)
+	Main = data.Main
+	Lib = data.Lib
+	Apps = data.Apps
+	Settings = data.Settings
+
+	API = data.API
+	RMD = data.RMD
+	env = data.env
+	service = data.service
+	plr = data.plr
+	create = data.create
+	createSimple = data.createSimple
+end
+
+local function initAfterMain()
+	Explorer = Apps.Explorer
+	Properties = Apps.Properties
+	ScriptViewer = Apps.ScriptViewer
+	Notebook = Apps.Notebook
+end
+
+local function main()
+	local Console = {}
+
+	local window,ConsoleFrame
+
+	local OutputLimit = 500 -- Same as Roblox Console.
+
+
+	-- Instances: 29 | Scripts: 1 | Modules: 1 | Tags: 0
+	local G2L = {};
+
+	-- StarterGui.ScreenGui
+	window = Lib.Window.new()
+	window:SetTitle("Console")
+	window:Resize(500,400)
+	Console.Window = window
+
+	-- StarterGui.ScreenGui.Console
+	ConsoleFrame = Instance.new("ImageButton", window.GuiElems.Content);
+	ConsoleFrame["BorderSizePixel"] = 0;
+	ConsoleFrame["AutoButtonColor"] = false;
+	ConsoleFrame["BackgroundTransparency"] = 1;
+	ConsoleFrame["BackgroundColor3"] = Color3.fromRGB(47, 47, 47);
+	ConsoleFrame["Selectable"] = false;
+	ConsoleFrame["Size"] = UDim2.new(1,0,1,0);
+	ConsoleFrame["BorderColor3"] = Color3.fromRGB(0, 0, 0);
+	ConsoleFrame["Name"] = [[Console]];
+	ConsoleFrame["Position"] = UDim2.new(0,0,0,0);
+
+
+	-- StarterGui.ScreenGui.Console.CommandLine
+	G2L["3"] = Lib.Frame.new().Gui--Instance.new("Frame", ConsoleFrame);
+	G2L["3"].Parent = ConsoleFrame
+	G2L["3"]["BorderSizePixel"] = 0;
+	G2L["3"]["BackgroundColor3"] = Color3.fromRGB(37, 37, 37);
+	G2L["3"]["AnchorPoint"] = Vector2.new(0.5, 1);
+	G2L["3"]["ClipsDescendants"] = true;
+	G2L["3"]["Size"] = UDim2.new(1, -8, 0, 22);
+	G2L["3"]["Position"] = UDim2.new(0.5, 0, 1, -5);
+	G2L["3"]["BorderColor3"] = Color3.fromRGB(0, 0, 0);
+	G2L["3"]["Name"] = [[CommandLine]];
+
+
+	-- StarterGui.ScreenGui.Console.CommandLine.UIStroke
+	G2L["4"] = Instance.new("UIStroke", G2L["3"]);
+	G2L["4"]["Transparency"] = 0.65;
+	G2L["4"]["Thickness"] = 1.25;
+
+
+	-- StarterGui.ScreenGui.Console.CommandLine.ScrollingFrame
+	G2L["5"] = Instance.new("ScrollingFrame", G2L["3"]);
+	G2L["5"]["Active"] = true;
+	G2L["5"]["ScrollingDirection"] = Enum.ScrollingDirection.X;
+	G2L["5"]["BorderSizePixel"] = 0;
+	G2L["5"]["CanvasSize"] = UDim2.new(0, 0, 0, 0);
+	G2L["5"]["ElasticBehavior"] = Enum.ElasticBehavior.Never;
+	G2L["5"]["TopImage"] = [[rbxasset://textures/ui/Scroll/scroll-middle.png]];
+	G2L["5"]["BackgroundColor3"] = Color3.fromRGB(255, 255, 255);
+	G2L["5"]["HorizontalScrollBarInset"] = Enum.ScrollBarInset.Always;
+	G2L["5"]["BottomImage"] = [[rbxasset://textures/ui/Scroll/scroll-middle.png]];
+	G2L["5"]["AutomaticCanvasSize"] = Enum.AutomaticSize.X;
+	G2L["5"]["Size"] = UDim2.new(1, 0, 1, 0);
+	G2L["5"]["ScrollBarImageColor3"] = Color3.fromRGB(57, 57, 57);
+	G2L["5"]["BorderColor3"] = Color3.fromRGB(0, 0, 0);
+	G2L["5"]["ScrollBarThickness"] = 2;
+	G2L["5"]["BackgroundTransparency"] = 1;
+
+	-- StarterGui.ScreenGui.Console.CommandLine.ScrollingFrame.TextBox
+	G2L["6"] = Instance.new("TextBox", G2L["5"]);
+	G2L["6"]["CursorPosition"] = -1;
+	G2L["6"]["TextXAlignment"] = Enum.TextXAlignment.Left;
+	G2L["6"]["PlaceholderColor3"] = Color3.fromRGB(211, 211, 211);
+	G2L["6"]["BorderSizePixel"] = 0;
+	G2L["6"]["TextSize"] = 13;
+	G2L["6"]["TextColor3"] = Color3.fromRGB(211, 211, 211);
+	G2L["6"]["BackgroundColor3"] = Color3.fromRGB(255, 255, 255);
+	G2L["6"]["FontFace"] = Font.new([[rbxasset://fonts/families/Inconsolata.json]], Enum.FontWeight.Regular, Enum.FontStyle.Normal);
+	G2L["6"]["AutomaticSize"] = Enum.AutomaticSize.X;
+	G2L["6"]["ClearTextOnFocus"] = false;
+	G2L["6"]["PlaceholderText"] = [[Run a command]];
+	G2L["6"]["Size"] = UDim2.new(0, 246, 0, 22);
+	G2L["6"]["BorderColor3"] = Color3.fromRGB(0, 0, 0);
+	G2L["6"]["Text"] = [[]];
+	G2L["6"]["BackgroundTransparency"] = 1;
+
+
+	-- StarterGui.ScreenGui.Console.CommandLine.ScrollingFrame.TextBox.UIPadding
+	G2L["7"] = Instance.new("UIPadding", G2L["6"]);
+	G2L["7"]["PaddingLeft"] = UDim.new(0, 7);
+
+
+	-- StarterGui.ScreenGui.Console.CommandLine.ScrollingFrame.Highlight
+	G2L["8"] = Instance.new("TextLabel", G2L["5"]);
+	G2L["8"]["Interactable"] = false;
+	G2L["8"]["ZIndex"] = 2;
+	G2L["8"]["BorderSizePixel"] = 0;
+	G2L["8"]["TextSize"] = 13;
+	G2L["8"]["TextXAlignment"] = Enum.TextXAlignment.Left;
+	G2L["8"]["BackgroundColor3"] = Color3.fromRGB(255, 255, 255);
+	G2L["8"]["FontFace"] = Font.new([[rbxasset://fonts/families/Inconsolata.json]], Enum.FontWeight.Regular, Enum.FontStyle.Normal);
+	G2L["8"]["TextColor3"] = Color3.fromRGB(255, 255, 255);
+	G2L["8"]["BackgroundTransparency"] = 1;
+	G2L["8"]["RichText"] = true;
+	G2L["8"]["Size"] = UDim2.new(0, 246, 0, 22);
+	G2L["8"]["BorderColor3"] = Color3.fromRGB(0, 0, 0);
+	G2L["8"]["Text"] = [[]];
+	G2L["8"]["Selectable"] = true;
+	G2L["8"]["AutomaticSize"] = Enum.AutomaticSize.X;
+	G2L["8"]["Name"] = [[Highlight]];
+
+
+	-- StarterGui.ScreenGui.Console.CommandLine.ScrollingFrame.Highlight.UIPadding
+	G2L["9"] = Instance.new("UIPadding", G2L["8"]);
+	G2L["9"]["PaddingLeft"] = UDim.new(0, 7);
+
+	G2L["backgroundOutput"] = Instance.new("Frame", ConsoleFrame);
+	G2L["backgroundOutput"]["BorderSizePixel"] = 0;
+	G2L["backgroundOutput"]["BackgroundColor3"] = Color3.fromRGB(36, 36, 36);
+	G2L["backgroundOutput"]["Name"] = [[BackgroundOutput]];
+	G2L["backgroundOutput"]["AnchorPoint"] = Vector2.new(0, 0);
+	G2L["backgroundOutput"]["Size"] = UDim2.new(1, -8, 1, -55);
+	G2L["backgroundOutput"]["Position"] = UDim2.new(0, 4, 0, 23);
+	G2L["backgroundOutput"]["BorderColor3"] = Color3.fromRGB(0, 0, 0);
+	G2L["backgroundOutput"]["ZIndex"] = 1;
+
+	local scrollbar = Lib.ScrollBar.new()
+	scrollbar.Gui.Parent = ConsoleFrame
+	scrollbar.Gui.Size = UDim2.new(0, 16, 1, -55);
+	scrollbar.Gui.Position = UDim2.new(1, -20,0, 23);
+	scrollbar.Gui.Up.ZIndex = 3
+	scrollbar.Gui.Down.ZIndex = 3
+
+	-- StarterGui.ScreenGui.Console.Output
+	G2L["a"] = Instance.new("ScrollingFrame", ConsoleFrame);
+	G2L["a"]["Active"] = true;
+	G2L["a"]["BorderSizePixel"] = 0;
+	G2L["a"]["CanvasSize"] = UDim2.new(0, 0, 0, 0);
+	G2L["a"]["TopImage"] = '';
+	G2L["a"]["BackgroundColor3"] = Color3.fromRGB(36, 36, 36);
+	G2L["a"].BackgroundTransparency = 1
+	G2L["a"]["Name"] = [[Output]];
+	G2L["a"]["ScrollBarImageTransparency"] = 0;
+	G2L["a"]["BottomImage"] = '';
+	G2L["a"]["AnchorPoint"] = Vector2.new(0, 0);
+	G2L["a"]["AutomaticCanvasSize"] = Enum.AutomaticSize.Y;
+	G2L["a"]["Size"] = UDim2.new(1, -8, 1, -55);
+	G2L["a"]["Position"] = UDim2.new(0, 4, 0, 23);
+	G2L["a"]["BorderColor3"] = Color3.fromRGB(0, 0, 0);
+	G2L["a"].ScrollBarImageColor3 = Color3.fromRGB(70, 70, 70)
+	G2L["a"]["ScrollBarThickness"] = 16;
+	G2L["a"]["ZIndex"] = 1;
+
+	G2L["a"]:GetPropertyChangedSignal("AbsoluteWindowSize"):Connect(function()
+		if G2L["a"].AbsoluteCanvasSize ~= G2L["a"].AbsoluteWindowSize then
+			scrollbar.Gui.Visible = true
+		else
+			scrollbar.Gui.Visible = false
+		end
+	end)
+
+	-- StarterGui.ScreenGui.Console.Output.UIListLayout
+	G2L["b"] = Instance.new("UIListLayout", G2L["a"]);
+	G2L["b"]["SortOrder"] = Enum.SortOrder.LayoutOrder;
+
+
+	-- StarterGui.ScreenGui.Console.Output.UIStroke
+	G2L["c"] = Instance.new("UIStroke", G2L["a"]);
+	G2L["c"]["Transparency"] = 0.7;
+	G2L["c"]["Thickness"] = 1.25;
+	G2L["c"]["Color"] = Color3.fromRGB(12, 12, 12);
+
+
+	-- StarterGui.ScreenGui.Console.Output.OutputTextSize
+	G2L["d"] = Instance.new("NumberValue", G2L["a"]);
+	G2L["d"]["Name"] = [[OutputTextSize]];
+	G2L["d"]["Value"] = 15;
+
+
+	-- StarterGui.ScreenGui.Console.Output.OutputLimit
+	G2L["e"] = Instance.new("NumberValue", G2L["a"]);
+	G2L["e"]["Name"] = [[OutputLimit]];
+	G2L["e"]["Value"] = OutputLimit;
+
+
+	-- StarterGui.ScreenGui.Console.Output.UIPadding
+	G2L["f"] = Instance.new("UIPadding", G2L["a"]);
+	G2L["f"]["PaddingTop"] = UDim.new(0, 2);
+
+
+	-- StarterGui.ScreenGui.Console.TextSizeBox
+	G2L["10"] = Instance.new("Frame", ConsoleFrame);
+	G2L["10"]["BorderSizePixel"] = 0;
+	G2L["10"]["BackgroundColor3"] = Color3.fromRGB(37, 37, 37);
+	G2L["10"]["ClipsDescendants"] = true;
+	G2L["10"]["Size"] = UDim2.new(0, 37, 0, 15);
+	G2L["10"]["Position"] = UDim2.new(0, 4, 0, 4);
+	G2L["10"]["BorderColor3"] = Color3.fromRGB(0, 0, 0);
+	G2L["10"]["Name"] = [[TextSizeBox]];
+
+
+	-- StarterGui.ScreenGui.Console.TextSizeBox.TextBox
+	G2L["11"] = Instance.new("TextBox", G2L["10"]);
+	G2L["11"]["PlaceholderColor3"] = Color3.fromRGB(108, 108, 108);
+	G2L["11"]["BorderSizePixel"] = 0;
+	G2L["11"]["TextWrapped"] = true;
+	G2L["11"]["TextSize"] = 15;
+	G2L["11"]["TextColor3"] = Color3.fromRGB(211, 211, 211);
+	G2L["11"]["TextScaled"] = true;
+	G2L["11"]["BackgroundColor3"] = Color3.fromRGB(255, 255, 255);
+	G2L["11"]["FontFace"] = Font.new([[rbxasset://fonts/families/Inconsolata.json]], Enum.FontWeight.Regular, Enum.FontStyle.Normal);
+	G2L["11"]["PlaceholderText"] = [[Size]];
+	G2L["11"]["Size"] = UDim2.new(1, 0, 1, 0);
+	G2L["11"]["BorderColor3"] = Color3.fromRGB(0, 0, 0);
+	G2L["11"]["Text"] = [[]];
+	G2L["11"]["BackgroundTransparency"] = 1;
+
+
+	-- StarterGui.ScreenGui.Console.TextSizeBox.TextBox.UIPadding
+	G2L["12"] = Instance.new("UIPadding", G2L["11"]);
+	G2L["12"]["PaddingTop"] = UDim.new(0, 2);
+	G2L["12"]["PaddingRight"] = UDim.new(0, 5);
+	G2L["12"]["PaddingLeft"] = UDim.new(0, 5);
+	G2L["12"]["PaddingBottom"] = UDim.new(0, 2);
+
+
+	-- StarterGui.ScreenGui.Console.TextSizeBox.UIStroke
+	G2L["13"] = Instance.new("UIStroke", G2L["10"]);
+	G2L["13"]["Transparency"] = 0.65;
+	G2L["13"]["Thickness"] = 1.25;
+
+
+	-- StarterGui.ScreenGui.Console.Clear
+	G2L["14"] = Instance.new("ImageButton", ConsoleFrame);
+	G2L["14"]["BorderSizePixel"] = 0;
+	G2L["14"]["BackgroundColor3"] = Color3.fromRGB(57, 57, 57);
+	G2L["14"]["Size"] = UDim2.new(0, 37, 0, 15);
+	G2L["14"]["BorderColor3"] = Color3.fromRGB(0, 0, 0);
+	G2L["14"]["Name"] = [[Clear]];
+	G2L["14"]["Position"] = UDim2.new(1, -42, 0, 4);
+
+
+	-- StarterGui.ScreenGui.Console.Clear.TextLabel
+	G2L["15"] = Instance.new("TextLabel", G2L["14"]);
+	G2L["15"]["TextWrapped"] = true;
+	G2L["15"]["Interactable"] = false;
+	G2L["15"]["BorderSizePixel"] = 0;
+	G2L["15"]["TextSize"] = 20;
+	G2L["15"]["TextScaled"] = true;
+	G2L["15"]["BackgroundColor3"] = Color3.fromRGB(255, 255, 255);
+	G2L["15"]["FontFace"] = Font.new([[rbxasset://fonts/families/SourceSansPro.json]], Enum.FontWeight.Regular, Enum.FontStyle.Normal);
+	G2L["15"]["TextColor3"] = Color3.fromRGB(255, 255, 255);
+	G2L["15"]["BackgroundTransparency"] = 1;
+	G2L["15"]["Size"] = UDim2.new(1, 0, 1, 0);
+	G2L["15"]["BorderColor3"] = Color3.fromRGB(0, 0, 0);
+	G2L["15"]["Text"] = [[Clear]];
+
+
+	-- StarterGui.ScreenGui.Console.Clear.UIPadding
+	G2L["16"] = Instance.new("UIPadding", G2L["14"]);
+	G2L["16"]["PaddingTop"] = UDim.new(0, 1);
+	G2L["16"]["PaddingBottom"] = UDim.new(0, 1);
+
+
+	-- StarterGui.ScreenGui.Console.OutputTemplate
+	G2L["17"] = Instance.new("TextBox", ConsoleFrame);
+	G2L["17"]["Visible"] = false;
+	G2L["17"]["Active"] = false;
+	G2L["17"]["Name"] = [[OutputTemplate]];
+	G2L["17"]["TextXAlignment"] = Enum.TextXAlignment.Left;
+	G2L["17"]["BorderSizePixel"] = 0;
+	G2L["17"]["TextEditable"] = false;
+	G2L["17"]["TextWrapped"] = true;
+	G2L["17"]["TextSize"] = 15;
+	G2L["17"]["TextColor3"] = Color3.fromRGB(171, 171, 171);
+	G2L["17"]["BackgroundColor3"] = Color3.fromRGB(255, 255, 255);
+	G2L["17"]["RichText"] = true;
+	G2L["17"]["FontFace"] = Font.new([[rbxasset://fonts/families/SourceSansPro.json]], Enum.FontWeight.Regular, Enum.FontStyle.Normal);
+	G2L["17"]["AutomaticSize"] = Enum.AutomaticSize.Y;
+	G2L["17"]["Selectable"] = false;
+	G2L["17"]["ClearTextOnFocus"] = false;
+	G2L["17"]["Size"] = UDim2.new(1, 0, 0, 1);
+	G2L["17"]["Position"] = UDim2.new(0, 20, 0, 0);
+	G2L["17"]["BorderColor3"] = Color3.fromRGB(0, 0, 0);
+	G2L["17"]["Text"] = [[(timestamp) <font color="rgb(255, 255, 255)">Output</font>]];
+	G2L["17"]["BackgroundTransparency"] = 1;
+
+
+	-- StarterGui.ScreenGui.Console.OutputTemplate.UIPadding
+	G2L["18"] = Instance.new("UIPadding", G2L["17"]);
+	G2L["18"]["PaddingRight"] = UDim.new(0, 6);
+	G2L["18"]["PaddingLeft"] = UDim.new(0, 6);
+
+
+	-- StarterGui.ScreenGui.Console.CtrlScroll
+	G2L["19"] = Instance.new("ImageButton", ConsoleFrame);
+	G2L["19"]["BorderSizePixel"] = 0;
+	G2L["19"]["BackgroundColor3"] = Color3.fromRGB(57, 57, 57);
+	G2L["19"]["Size"] = UDim2.new(0, 60, 0, 15);
+	G2L["19"]["BorderColor3"] = Color3.fromRGB(0, 0, 0);
+	G2L["19"]["Name"] = [[CtrlScroll]];
+	G2L["19"]["Position"] = UDim2.new(0, 46, 0, 4);
+
+
+	-- StarterGui.ScreenGui.Console.CtrlScroll.TextLabel
+	G2L["1a"] = Instance.new("TextLabel", G2L["19"]);
+	G2L["1a"]["TextWrapped"] = true;
+	G2L["1a"]["Interactable"] = false;
+	G2L["1a"]["BorderSizePixel"] = 0;
+	G2L["1a"]["TextSize"] = 20;
+	G2L["1a"]["TextScaled"] = true;
+	G2L["1a"]["BackgroundColor3"] = Color3.fromRGB(255, 255, 255);
+	G2L["1a"]["FontFace"] = Font.new([[rbxasset://fonts/families/SourceSansPro.json]], Enum.FontWeight.Regular, Enum.FontStyle.Normal);
+	G2L["1a"]["TextColor3"] = Color3.fromRGB(255, 255, 255);
+	G2L["1a"]["BackgroundTransparency"] = 1;
+	G2L["1a"]["Size"] = UDim2.new(1, 0, 1, 0);
+	G2L["1a"]["BorderColor3"] = Color3.fromRGB(0, 0, 0);
+	G2L["1a"]["Text"] = [[Ctrl Scroll]];
+
+
+	-- StarterGui.ScreenGui.Console.CtrlScroll.UIPadding
+	G2L["1b"] = Instance.new("UIPadding", G2L["19"]);
+	G2L["1b"]["PaddingTop"] = UDim.new(0, 1);
+	G2L["1b"]["PaddingBottom"] = UDim.new(0, 1);
+
+	-- StarterGui.ScreenGui.Console.AutoScroll
+	G2L["20"] = Instance.new("ImageButton", ConsoleFrame);
+	G2L["20"]["BorderSizePixel"] = 0;
+	G2L["20"]["BackgroundColor3"] = Color3.fromRGB(57, 57, 57);
+	G2L["20"]["Size"] = UDim2.new(0, 60, 0, 15);
+	G2L["20"]["BorderColor3"] = Color3.fromRGB(0, 0, 0);
+	G2L["20"]["Name"] = [[AutoScroll]];
+	G2L["20"]["Position"] = UDim2.new(0, 110, 0, 4);
+
+
+	-- StarterGui.ScreenGui.Console.AutoScroll.TextLabel
+	G2L["1e"] = Instance.new("TextLabel", G2L["20"]);
+	G2L["1e"]["TextWrapped"] = true;
+	G2L["1e"]["Interactable"] = false;
+	G2L["1e"]["BorderSizePixel"] = 0;
+	G2L["1e"]["TextSize"] = 20;
+	G2L["1e"]["TextScaled"] = true;
+	G2L["1e"]["BackgroundColor3"] = Color3.fromRGB(255, 255, 255);
+	G2L["1e"]["FontFace"] = Font.new([[rbxasset://fonts/families/SourceSansPro.json]], Enum.FontWeight.Regular, Enum.FontStyle.Normal);
+	G2L["1e"]["TextColor3"] = Color3.fromRGB(255, 255, 255);
+	G2L["1e"]["BackgroundTransparency"] = 1;
+	G2L["1e"]["Size"] = UDim2.new(1, 0, 1, 0);
+	G2L["1e"]["BorderColor3"] = Color3.fromRGB(0, 0, 0);
+	G2L["1e"]["Text"] = [[Auto Scroll]];
+
+
+	-- StarterGui.ScreenGui.Console.AutoScroll.UIPadding
+	G2L["1f"] = Instance.new("UIPadding", G2L["20"]);
+	G2L["1f"]["PaddingTop"] = UDim.new(0, 1);
+	G2L["1f"]["PaddingBottom"] = UDim.new(0, 1);
+
+
+	-- StarterGui.ScreenGui.ConsoleHandler
+	G2L["1c"] = Instance.new("LocalScript", G2L["1"]);
+	G2L["1c"]["Name"] = [[ConsoleHandler]];
+
+
+	-- StarterGui.ScreenGui.ConsoleHandler.SyntaxHighlighter
+	G2L["1d"] = Instance.new("ModuleScript", G2L["1c"]);
+	G2L["1d"]["Name"] = [[SyntaxHighlighter]];
+
+
+	-- Require G2L wrapper
+	local G2L_REQUIRE = require;
+	local G2L_MODULES = {};
+	local function require(Module)
+		local ModuleState = G2L_MODULES[Module];
+		if ModuleState then
+			if not ModuleState.Required then
+				ModuleState.Required = true;
+				ModuleState.Value = ModuleState.Closure();
+			end
+			return ModuleState.Value;
+		end;
+		return G2L_REQUIRE(Module);
+	end
+
+	G2L_MODULES[G2L["1d"]] = {
+		Closure = function()
+			local script = G2L["1d"];local highlighter = {}
+			local keywords = {
+				lua = {
+					"and", "break", "or", "else", "elseif", "if", "then", "until", "repeat", "while", "do", "for", "in", "end",
+					"local", "return", "function", "export"
+				},
+				rbx = {
+					"game", "workspace", "script", "math", "string", "table", "task", "wait", "select", "next", "Enum",
+					"error", "warn", "tick", "assert", "shared", "loadstring", "tonumber", "tostring", "type",
+					"typeof", "unpack", "print", "Instance", "CFrame", "Vector3", "Vector2", "Color3", "UDim", "UDim2", "Ray", "BrickColor",
+					"OverlapParams", "RaycastParams", "Axes", "Random", "Region3", "Rect", "TweenInfo",
+					"collectgarbage", "not", "utf8", "pcall", "xpcall", "_G", "setmetatable", "getmetatable", "os", "pairs", "ipairs"
+				},
+				exploit = {
+					"hookmetamethod", "hookfunction", "getgc", "filtergc", "Drawing", "getgenv", "getsenv", "getrenv", "getfenv", "setfenv",
+					"decompile", "saveinstance", "getrawmetatable", "setrawmetatable", "checkcaller", "cloneref", "clonefunction",
+					"iscclosure", "islclosure", "isexecutorclosure", "newcclosure", "getfunctionhash", "crypt", "writefile", "appendfile", "loadfile", "readfile", "listfiles",
+					"makefolder", "isfolder", "isfile", "delfile", "delfolder", "getcustomasset", "fireclickdetector", "firetouchinterest", "fireproximityprompt"
+				},
+				operators = {
+					"#", "+", "-", "*", "%", "/", "^", "=", "~", "=", "<", ">", ",", ".", "(", ")", "{", "}", "[", "]", ";", ":"
+				}
+			}
+
+			local colors = {
+				numbers = Color3.fromRGB(255, 198, 0),
+				boolean = Color3.fromRGB(255, 198, 0),
+				operator = Color3.fromRGB(204, 204, 204),
+				lua = Color3.fromRGB(132, 214, 247),
+				exploit = Color3.fromRGB(171, 84, 247),
+				rbx = Color3.fromRGB(248, 109, 124),
+				str = Color3.fromRGB(173, 241, 132),
+				comment = Color3.fromRGB(102, 102, 102),
+				null = Color3.fromRGB(255, 198, 0),
+				call = Color3.fromRGB(253, 251, 172),
+				self_call = Color3.fromRGB(253, 251, 172),
+				local_color = Color3.fromRGB(248, 109, 115),
+				function_color = Color3.fromRGB(248, 109, 115),
+				self_color = Color3.fromRGB(248, 109, 115),
+				local_property = Color3.fromRGB(97, 161, 241),
+			}
+
+			local function createKeywordSet(keywords)
+				local keywordSet = {}
+				for _, keyword in ipairs(keywords) do
+					keywordSet[keyword] = true
+				end
+				return keywordSet
+			end
+
+			local luaSet = createKeywordSet(keywords.lua)
+			local exploitSet = createKeywordSet(keywords.exploit)
+			local rbxSet = createKeywordSet(keywords.rbx)
+			local operatorsSet = createKeywordSet(keywords.operators)
+
+			local function getHighlight(tokens, index)
+				local token = tokens[index]
+
+				if colors[token .. "_color"] then
+					return colors[token .. "_color"]
+				end
+
+				if tonumber(token) then
+					return colors.numbers
+				elseif token == "nil" then
+					return colors.null
+				elseif token:sub(1, 2) == "--" then
+					return colors.comment
+				elseif operatorsSet[token] then
+					return colors.operator
+				elseif luaSet[token] then
+					return colors.rbx
+				elseif rbxSet[token] then
+					return colors.lua
+				elseif exploitSet[token] then
+					return colors.exploit
+				elseif token:sub(1, 1) == "\"" or token:sub(1, 1) == "\'" then
+					return colors.str
+				elseif token == "true" or token == "false" then
+					return colors.boolean
+				end
+
+				if tokens[index + 1] == "(" then
+					if tokens[index - 1] == ":" then
+						return colors.self_call
+					end
+
+					return colors.call
+				end
+
+				if tokens[index - 1] == "." then
+					if tokens[index - 2] == "Enum" then
+						return colors.rbx
+					end
+
+					return colors.local_property
+				end
+			end
+
+			function highlighter.run(source)
+				local tokens = {}
+				local currentToken = ""
+
+				local inString = false
+				local inComment = false
+				local commentPersist = false
+
+				for i = 1, #source do
+					local character = source:sub(i, i)
+
+					if inComment then
+						if character == "\n" and not commentPersist then
+							table.insert(tokens, currentToken)
+							table.insert(tokens, character)
+							currentToken = ""
+
+							inComment = false
+						elseif source:sub(i - 1, i) == "]]" and commentPersist then
+							currentToken ..= "]"
+
+							table.insert(tokens, currentToken)
+							currentToken = ""
+
+							inComment = false
+							commentPersist = false
+						else
+							currentToken = currentToken .. character
+						end
+					elseif inString then
+						if character == inString and source:sub(i-1, i-1) ~= "\\" or character == "\n" then
+							currentToken = currentToken .. character
+							inString = false
+						else
+							currentToken = currentToken .. character
+						end
+					else
+						if source:sub(i, i + 1) == "--" then
+							table.insert(tokens, currentToken)
+							currentToken = "-"
+							inComment = true
+							commentPersist = source:sub(i + 2, i + 3) == "[["
+						elseif character == "\"" or character == "\'" then
+							table.insert(tokens, currentToken)
+							currentToken = character
+							inString = character
+						elseif operatorsSet[character] then
+							table.insert(tokens, currentToken)
+							table.insert(tokens, character)
+							currentToken = ""
+						elseif character:match("[%w_]") then
+							currentToken = currentToken .. character
+						else
+							table.insert(tokens, currentToken)
+							table.insert(tokens, character)
+							currentToken = ""
+						end
+					end
+				end
+
+				table.insert(tokens, currentToken)
+
+				local highlighted = {}
+
+				for i, token in ipairs(tokens) do
+					local highlight = getHighlight(tokens, i)
+
+					if highlight then
+						local syntax = string.format("<font color = \"#%s\">%s</font>", highlight:ToHex(), token:gsub("<", "&lt;"):gsub(">", "&gt;"))
+
+						table.insert(highlighted, syntax)
+					else
+						table.insert(highlighted, token)
+					end
+				end
+
+				return table.concat(highlighted)
+			end
+
+			return highlighter
+		end;
+	};
+
+	Console.Init = function()
+		-- StarterGui.ScreenGui.ConsoleHandler
+
+		local CtrlScroll = false
+		local AutoScroll = false
+
+		local LogService = game:GetService("LogService")
+		local Players = game:GetService("Players")
+		local LocalPlayer = Players.LocalPlayer
+		local Mouse = LocalPlayer:GetMouse()
+		local UserInputService = game:GetService("UserInputService")
+		local RunService = game:GetService("RunService")
+
+		local Console = ConsoleFrame
+		local SyntaxHighlightingModule = require(G2L["1c"].SyntaxHighlighter)
+		local OutputTextSize = Console.Output.OutputTextSize
+
+		local function Tween(obj, info, prop)
+			local tween = game:GetService("TweenService"):Create(obj, info, prop)
+			tween:Play()
+			return tween
+		end
+
+
+
+		-- MOUSE STUFFS
+
+		if CtrlScroll == true then
+			Console.CtrlScroll.BackgroundColor3 = Color3.fromRGB(11, 90, 175)
+		elseif CtrlScroll == false then
+			Console.CtrlScroll.BackgroundColor3 = Color3.fromRGB(56, 56, 56)
+		end
+		Console.CtrlScroll.MouseButton1Click:Connect(function()
+			CtrlScroll = not CtrlScroll
+			if CtrlScroll == true then
+				Console.CtrlScroll.BackgroundColor3 = Color3.fromRGB(11, 90, 175)
+			elseif CtrlScroll == false then
+				Console.CtrlScroll.BackgroundColor3 = Color3.fromRGB(56, 56, 56)
+			end
+		end)
+
+		local IsHoldingCTRL = false
+		UserInputService.InputBegan:Connect(function(input, gameproc)
+			if not gameproc then
+				if input.KeyCode == Enum.KeyCode.LeftControl or input.KeyCode == Enum.KeyCode.RightControl then
+					IsHoldingCTRL = true
+				end
+			end
+		end)
+		UserInputService.InputEnded:Connect(function(input, gameproc)
+			if not gameproc then
+				if input.KeyCode == Enum.KeyCode.LeftControl or input.KeyCode == Enum.KeyCode.RightControl then
+					IsHoldingCTRL = false
+				end
+			end
+		end)
+
+		if AutoScroll == true then
+			Console.AutoScroll.BackgroundColor3 = Color3.fromRGB(11, 90, 175)
+		elseif AutoScroll == false then
+			Console.AutoScroll.BackgroundColor3 = Color3.fromRGB(56, 56, 56)
+		end
+		Console.AutoScroll.MouseButton1Click:Connect(function()
+			AutoScroll = not AutoScroll
+			if AutoScroll == true then
+				Console.AutoScroll.BackgroundColor3 = Color3.fromRGB(11, 90, 175)
+				Console.Output.CanvasPosition = Vector2.new(0, 9e9)
+			elseif AutoScroll == false then
+				Console.AutoScroll.BackgroundColor3 = Color3.fromRGB(56, 56, 56)
+			end
+		end)
+
+		-- Console part
+		local displayedOutput = {}
+		local OutputLimit = Console.Output.OutputLimit
+
+		Console.TextSizeBox.TextBox.Text = tostring(OutputTextSize.Value)
+
+		Console.TextSizeBox.TextBox:GetPropertyChangedSignal("Text"):Connect(function()
+			local tonum = tonumber(Console.TextSizeBox.TextBox.Text)
+			if tonum then
+				OutputTextSize.Value = tonum
+			end
+		end)
+		OutputTextSize:GetPropertyChangedSignal("Value"):Connect(function()
+			Console.TextSizeBox.TextBox.Text = tostring(OutputTextSize.Value)
+		end)
+
+		local scrollConsoleInput
+		Console.Output.MouseEnter:Connect(function()
+			scrollConsoleInput = UserInputService.InputChanged:Connect(function(input)
+				if CtrlScroll and input.UserInputType == Enum.UserInputType.MouseWheel and IsHoldingCTRL == true then
+					Console.Output.ScrollingEnabled = false
+					local newTextSize = OutputTextSize.Value + input.Position.Z
+					if newTextSize >= 1 then
+						OutputTextSize.Value = newTextSize
+					end
+				else
+					Console.Output.ScrollingEnabled = true
+				end
+			end)
+		end)
+		Console.Output.MouseLeave:Connect(function()
+			if scrollConsoleInput then
+				scrollConsoleInput:Disconnect()
+				scrollConsoleInput = nil
+			end
+		end)
+
+
+		Console.Clear.MouseButton1Click:Connect(function()
+			for _, log in pairs(Console.Output:GetChildren()) do
+				if log:IsA("TextBox") then
+					log:Destroy()
+				end
+			end
+		end)
+
+		local focussedOutput
+
+		LogService.MessageOut:Connect(function(msg, msgtype)
+			local formattedText = ""
+			local unformattedText = ""
+			local newOutputText = Console.OutputTemplate:Clone()
+			table.insert(displayedOutput, newOutputText)
+
+			if #displayedOutput > OutputLimit.Value then
+				local oldest = table.remove(displayedOutput, 1)
+				if oldest and typeof(oldest) == "Instance" then
+					oldest:Destroy()
+				end
+			end
+
+			unformattedText = os.date("%H:%M:%S")..'   '..msg
+			if msgtype == Enum.MessageType.MessageOutput then
+				formattedText = os.date("%H:%M:%S")..'   <font color="rgb(204, 204, 204)">'..msg..'</font>'
+				newOutputText.Text = formattedText
+			elseif msgtype == Enum.MessageType.MessageWarning then
+				formattedText = os.date("%H:%M:%S")..'   <b><font color="rgb(255, 142, 60)">'..msg..'</font></b>'
+				newOutputText.Text = formattedText
+			elseif msgtype == Enum.MessageType.MessageError then
+				formattedText = os.date("%H:%M:%S")..'   <b><font color="rgb(255, 68, 68)">'..msg..'</font></b>'
+				newOutputText.Text = formattedText
+			elseif msgtype == Enum.MessageType.MessageInfo then
+				formattedText = os.date("%H:%M:%S")..'   <font color="rgb(128, 215, 255)">'..msg..'</font>'
+				newOutputText.Text = formattedText
+			end
+
+			newOutputText.TextSize = OutputTextSize.Value
+			OutputTextSize:GetPropertyChangedSignal("Value"):Connect(function()
+				newOutputText.TextSize = OutputTextSize.Value
+			end)
+
+			newOutputText.Focused:Connect(function()
+				focussedOutput = newOutputText
+				newOutputText.Text = unformattedText
+			end)
+			newOutputText.FocusLost:Connect(function()
+				focussedOutput = nil
+				newOutputText.Text = formattedText
+			end)
+
+			newOutputText.Parent = Console.Output
+			newOutputText.Visible = true
+
+			if AutoScroll then
+				Console.Output.CanvasPosition = Vector2.new(0, 9e9)
+			end
+		end)
+
+		Console.Output.MouseLeave:Connect(function()
+			if focussedOutput then
+				focussedOutput:ReleaseFocus()
+			end
+		end)
+
+		Console.CommandLine.ScrollingFrame.TextBox:GetPropertyChangedSignal("Text"):Connect(function()
+
+			local oneliner = string.gsub(Console.CommandLine.ScrollingFrame.TextBox.Text, "\n", "    ")
+			Console.CommandLine.ScrollingFrame.TextBox.Text = oneliner
+
+			Console.CommandLine.ScrollingFrame.Highlight.Text = SyntaxHighlightingModule.run(Console.CommandLine.ScrollingFrame.TextBox.Text)
+		end)
+
+
+
+		Console.CommandLine.ScrollingFrame.TextBox.FocusLost:Connect(function(enterPressed)
+			if enterPressed and Console.CommandLine.ScrollingFrame.TextBox.Text ~= "" then
+				print("> "..Console.CommandLine.ScrollingFrame.TextBox.Text)
+				loadstring(Console.CommandLine.ScrollingFrame.TextBox.Text)()
+			end
 		end)
 	end
+
+	return Console
 end
 
---==============================================================
--- PREDICTION
---==============================================================
-local function totalLag()
-	return CFG.REACTION_LAG + (CFG.PING_COMP and pingValue*0.5 or 0)
-end
-local function updatePing(now)
-	if now-lastPingAt<1 then return end
-	lastPingAt=now
-	local ok,p=pcall(function() return LocalPlayer:GetNetworkPing() end)
-	if ok and type(p)=="number" and p==p then pingValue=math.clamp(p,0,0.5) end
-end
-local function threatPosition(th,t)
-	if not th.cf then return ZERO end
-	local a=th.accel or ZERO
-	return th.cf.Position + (th.vel or ZERO)*t + a*(0.5*t*t)
-end
-local function clearanceAt(th,point,t)
-	if not th or not point then return CAP end
-	local tp=threatPosition(th,t)
-	if th.kind=="ell" then
-		local rf,rs,ry=(th.rf or 2)+(th.uncertainty or 0),(th.rs or 2)+(th.uncertainty or 0)*0.5,th.ry or 3
-		local off=th.cf and th.cf:VectorToObjectSpace(point-tp) or (point-tp)
-		local d=math.sqrt((off.X/math.max(rs,0.1))^2+(off.Y/math.max(ry,0.1))^2+(off.Z/math.max(rf,0.1))^2)
-		return (d-1)*math.min(rf,rs)
-	elseif th.kind=="box" then
-		local half=th.half or Vector3.new(2,2,2)
-		local o=th.cf and th.cf:VectorToObjectSpace(point-tp) or (point-tp)
-		local dx=math.max(math.abs(o.X)-half.X,0)
-		local dy=math.max(math.abs(o.Y)-half.Y,0)
-		local dz=math.max(math.abs(o.Z)-half.Z,0)
-		return math.sqrt(dx*dx+dy*dy+dz*dz)
-	elseif th.kind=="lane" then
-		local origin=th.cf.Position; local look=th.look or Vector3.new(0,0,-1)
-		local toP=point-origin; local along=toP:Dot(look)
-		if along<-1 or along>(th.maxLen or FAR)+2 then return CAP end
-		return (toP-look*along).Magnitude-(th.width or 2)-(th.uncertainty or 0)
-	end
-	return (point-tp).Magnitude-((th.radius or 2)+(th.uncertainty or 0))
+return {InitDeps = initDeps, InitAfterMain = initAfterMain, Main = main}
+end,
+["Explorer"] = function()
+--[[
+	Explorer App Module
+	
+	The main explorer interface
+]]
+
+-- Common Locals
+local Main,Lib,Apps,Settings -- Main Containers
+local Explorer, Properties, ScriptViewer, ModelViewer, Notebook -- Major Apps
+local API,RMD,env,service,plr,create,createSimple -- Main Locals
+
+local function initDeps(data)
+	Main = data.Main
+	Lib = data.Lib
+	Apps = data.Apps
+	Settings = data.Settings
+
+	API = data.API
+	RMD = data.RMD
+	env = data.env
+	service = data.service
+	plr = data.plr
+	create = data.create
+	createSimple = data.createSimple
 end
 
---==============================================================
--- DETECTION (budgeted)
---==============================================================
-local function addThreat(list,th)
-	if not th or not th.cf or not finiteVec(th.cf.Position) then return end
-	th.existence=th.existence or th.confidence or 0.5
-	th.intent=th.intent or 0.5; th.hitProb=th.hitProb or 0.5; th.severity=th.severity or 0.5
-	th.uncertainty=th.uncertainty or 0.5; th.velUnc=th.velUnc or 2; th.timeUnc=th.timeUnc or 0.05
-	th.from=th.from or 0; th.to=th.to or CFG.HORIZON
-	if th.to<th.from then th.to=th.from+0.1 end
-	th.confidence=th.existence*(0.4+0.6*th.intent)
-	if th.confidence<CFG.THREAT_CONFIDENCE_MIN and not th.urgent then return end
-	if type(CFG.FilterThreatHook)=="function" then
-		local ok,keep=pcall(CFG.FilterThreatHook,th); if ok and keep==false then return end
-	end
-	list[#list+1]=th
+local function initAfterMain()
+	Explorer = Apps.Explorer
+	Properties = Apps.Properties
+	ScriptViewer = Apps.ScriptViewer
+	ModelViewer = Apps.ModelViewer
+	Notebook = Apps.Notebook
 end
-local function ownerOf(part)
-	local c=ownerCache[part]
-	if c and os.clock()-c.t<2 then return c.owner end
-	local model=part:FindFirstAncestorOfClass("Model")
-	local owner=model
-	if model then local plr=Players:GetPlayerFromCharacter(model); if plr then owner=plr end end
-	ownerCache[part]={owner=owner,t=os.clock()}; return owner
-end
-local function softIgnore(part,model)
-	if not part then return false end
-	if CFG.SOFT_NAME_IGNORE and containsToken(part.Name,CFG.IGNORE_NAME_WORDS) then return true end
-	if CFG.SOFT_TEAM_IGNORE and LocalPlayer.Team and model then
-		local plr=Players:GetPlayerFromCharacter(model)
-		if plr and plr.Team==LocalPlayer.Team and plr~=LocalPlayer then return true end
-	end
-	return false
-end
-local function detectActors(list,myPos,now)
-	if not CFG.DETECT_ACTORS then return end
-	local R=CFG.DETECT_RADIUS
-	for model,rec in pairs(actorCache) do
-		if not model.Parent then actorCache[model]=nil
+
+local function main()
+	local Explorer = {}
+	local tree,listEntries,explorerOrders,searchResults,specResults = {},{},{},{},{}
+	local expanded
+	local entryTemplate,treeFrame,toolBar,descendantAddedCon,descendantRemovingCon,itemChangedCon
+	local ffa = game.FindFirstAncestorWhichIsA
+	local getDescendants = game.GetDescendants
+	local getTextSize = service.TextService.GetTextSize
+	local updateDebounce,refreshDebounce = false,false
+	local nilNode = {Obj = Instance.new("Folder")}
+	local idCounter = 0
+	local scrollV,scrollH,clipboard
+	local renameBox,renamingNode,searchFunc
+	local sortingEnabled,autoUpdateSearch
+	local table,math = table,math
+	local nilMap,nilCons = {},{}
+	local connectSignal = game.DescendantAdded.Connect
+	local addObject,removeObject,moveObject = nil,nil,nil
+
+	local iconData
+	local remote_blocklist = {} -- list of remotes beng blocked, k = the remote instance, v = their old function :3
+	nodes = nodes or {}
+
+	addObject = function(root)
+		if nodes[root] then return end
+
+		local isNil = false
+		local rootParObj = ffa(root,"Instance")
+		local par = nodes[rootParObj]
+
+		-- Nil Handling
+		if not par then
+			if nilMap[root] then
+				nilCons[root] = nilCons[root] or {
+					connectSignal(root.ChildAdded,addObject),
+					connectSignal(root.AncestryChanged,moveObject),
+				}
+				par = nilNode
+				isNil = true
+			else
+				return
+			end
+		elseif nilMap[rootParObj] or par == nilNode then
+			nilMap[root] = true
+			nilCons[root] = nilCons[root] or {
+				connectSignal(root.ChildAdded,addObject),
+				connectSignal(root.AncestryChanged,moveObject),
+			}
+			isNil = true
+		end
+
+		local newNode = {Obj = root, Parent = par}
+		nodes[root] = newNode
+
+		-- Automatic sorting if expanded
+		if sortingEnabled and expanded[par] and par.Sorted then
+			local left,right = 1,#par
+			local floor = math.floor
+			local sorter = Explorer.NodeSorter
+			local pos = (right == 0 and 1)
+
+			if not pos then
+				while true do
+					if left >= right then
+						if sorter(newNode,par[left]) then
+							pos = left
+						else
+							pos = left+1
+						end
+						break
+					end
+
+					local mid = floor((left+right)/2)
+					if sorter(newNode,par[mid]) then
+						right = mid-1
+					else
+						left = mid+1
+					end
+				end
+			end
+
+			table.insert(par,pos,newNode)
 		else
-			local root=rec.root
-			if not root or not root.Parent then root=getRoot(model); rec.root=root end
-			if root then
-				local d=(root.Position-myPos).Magnitude
-				if d<=R and not softIgnore(root,model) then
-					local hum=rec.hum
-					local attackConf,hitFrom,hitTo,attackType=0,nil,nil,"melee"
-					local animator=hum and hum:FindFirstChildOfClass("Animator")
-					if animator then
-						for _,track in ipairs(animator:GetPlayingAnimationTracks()) do
-							if track.IsPlaying then
-								local id=""
-								pcall(function() id=track.Animation and tostring(track.Animation.AnimationId):match("%d+") or "" end)
-								local L=learned[id]
-								local known=id~="" and (CFG.ATTACK_ANIMATION_IDS[id] or (L and L.n>=CFG.LEARN_MIN_HITS))
-								local isAction=track.Priority==Enum.AnimationPriority.Action
-									or track.Priority==Enum.AnimationPriority.Action2
-									or track.Priority==Enum.AnimationPriority.Action3
-									or track.Priority==Enum.AnimationPriority.Action4
-								if known or (CFG.USE_ACTION_ANIMATIONS and isAction and not track.Looped) then
-									local len=track.Length>0 and track.Length or 1
-									local pos,spd=track.TimePosition,math.max(track.Speed,0.05)
-									local meanHit=(L and L.mean) or 0.35
-									local tth=(meanHit-pos)/spd
-									if track.Looped and tth<-0.05 then tth=tth+len/spd end
-									if tth>=-0.1 and tth<CFG.HORIZON+0.2 then
-										attackConf=math.max(attackConf, known and 0.82 or 0.45)
-										hitFrom=math.max(0,tth-CFG.LEARN_EARLY); hitTo=tth+CFG.LEARN_LATE
-									end
+			par[#par+1] = newNode
+			par.Sorted = nil
+		end
+
+		local insts = getDescendants(root)
+		for i = 1,#insts do
+			local obj = insts[i]
+			if nodes[obj] then continue end -- Deferred
+
+			local par = nodes[ffa(obj,"Instance")]
+			if not par then continue end
+			local newNode = {Obj = obj, Parent = par}
+			nodes[obj] = newNode
+			par[#par+1] = newNode
+
+			-- Nil Handling
+			if isNil then
+				nilMap[obj] = true
+				nilCons[obj] = nilCons[obj] or {
+					connectSignal(obj.ChildAdded,addObject),
+					connectSignal(obj.AncestryChanged,moveObject),
+				}
+			end
+		end
+
+		if searchFunc and autoUpdateSearch then
+			searchFunc({newNode})
+		end
+
+		if not updateDebounce and Explorer.IsNodeVisible(par) then
+			if expanded[par] then
+				Explorer.PerformUpdate()
+			elseif not refreshDebounce then
+				Explorer.PerformRefresh()
+			end
+		end
+	end
+
+	removeObject = function(root)
+		local node = nodes[root]
+		if not node then return end
+
+		-- Nil Handling
+		if nilMap[node.Obj] then
+			moveObject(node.Obj)
+			return
+		end
+
+		local par = node.Parent
+		if par then
+			par.HasDel = true
+		end
+
+		local function recur(root)
+			for i = 1,#root do
+				local node = root[i]
+				if not node.Del then
+					nodes[node.Obj] = nil
+					if #node > 0 then recur(node) end
+				end
+			end
+		end
+		recur(node)
+		node.Del = true
+		nodes[root] = nil
+
+		if par and not updateDebounce and Explorer.IsNodeVisible(par) then
+			if expanded[par] then
+				Explorer.PerformUpdate()
+			elseif not refreshDebounce then
+				Explorer.PerformRefresh()
+			end
+		end
+	end
+
+	moveObject = function(obj)
+		local node = nodes[obj]
+		if not node then return end
+
+		local oldPar = node.Parent
+		local newPar = nodes[ffa(obj,"Instance")]
+		if oldPar == newPar then return end
+
+		-- Nil Handling
+		if not newPar then
+			if nilMap[obj] then
+				newPar = nilNode
+			else
+				return
+			end
+		elseif nilMap[newPar.Obj] or newPar == nilNode then
+			nilMap[obj] = true
+			nilCons[obj] = nilCons[obj] or {
+				connectSignal(obj.ChildAdded,addObject),
+				connectSignal(obj.AncestryChanged,moveObject),
+			}
+		end
+
+		if oldPar then
+			local parPos = table.find(oldPar,node)
+			if parPos then table.remove(oldPar,parPos) end
+		end
+
+		node.Id = nil
+		node.Parent = newPar
+
+		if sortingEnabled and expanded[newPar] and newPar.Sorted then
+			local left,right = 1,#newPar
+			local floor = math.floor
+			local sorter = Explorer.NodeSorter
+			local pos = (right == 0 and 1)
+
+			if not pos then
+				while true do
+					if left >= right then
+						if sorter(node,newPar[left]) then
+							pos = left
+						else
+							pos = left+1
+						end
+						break
+					end
+
+					local mid = floor((left+right)/2)
+					if sorter(node,newPar[mid]) then
+						right = mid-1
+					else
+						left = mid+1
+					end
+				end
+			end
+
+			table.insert(newPar,pos,node)
+		else
+			newPar[#newPar+1] = node
+			newPar.Sorted = nil
+		end
+
+		if searchFunc and searchResults[node] then
+			local currentNode = node.Parent
+			while currentNode and (not searchResults[currentNode] or expanded[currentNode] == 0) do
+				expanded[currentNode] = true
+				searchResults[currentNode] = true
+				currentNode = currentNode.Parent
+			end
+		end
+
+		if not updateDebounce and (Explorer.IsNodeVisible(newPar) or Explorer.IsNodeVisible(oldPar)) then
+			if expanded[newPar] or expanded[oldPar] then
+				Explorer.PerformUpdate()
+			elseif not refreshDebounce then
+				Explorer.PerformRefresh()
+			end
+		end
+	end
+
+	Explorer.ViewWidth = 0
+	Explorer.Index = 0
+	Explorer.EntryIndent = 20
+	Explorer.FreeWidth = 32
+	Explorer.GuiElems = {}
+
+	Explorer.InitRenameBox = function()
+		renameBox = create({{1,"TextBox",{BackgroundColor3=Color3.new(0.17647059261799,0.17647059261799,0.17647059261799),BorderColor3=Color3.new(0.062745101749897,0.51764708757401,1),BorderMode=2,ClearTextOnFocus=false,Font=3,Name="RenameBox",PlaceholderColor3=Color3.new(0.69803923368454,0.69803923368454,0.69803923368454),Position=UDim2.new(0,26,0,2),Size=UDim2.new(0,200,0,16),Text="",TextColor3=Color3.new(1,1,1),TextSize=14,TextXAlignment=0,Visible=false,ZIndex=2}}})
+
+		renameBox.Parent = Explorer.Window.GuiElems.Content.List
+
+		renameBox.FocusLost:Connect(function()
+			if not renamingNode then return end
+
+			pcall(function() renamingNode.Obj.Name = renameBox.Text end)
+			renamingNode = nil
+			Explorer.Refresh()
+		end)
+
+		renameBox.Focused:Connect(function()
+			renameBox.SelectionStart = 1
+			renameBox.CursorPosition = #renameBox.Text + 1
+		end)
+	end
+
+	Explorer.SetRenamingNode = function(node)
+		renamingNode = node
+		renameBox.Text = tostring(node.Obj)
+		renameBox:CaptureFocus()
+		Explorer.Refresh()
+	end
+
+	Explorer.SetSortingEnabled = function(val)
+		sortingEnabled = val
+		Settings.Explorer.Sorting = val
+	end
+
+	Explorer.UpdateView = function()
+		local maxNodes = math.ceil(treeFrame.AbsoluteSize.Y / 20)
+		local maxX = treeFrame.AbsoluteSize.X
+		local totalWidth = Explorer.ViewWidth + Explorer.FreeWidth
+
+		scrollV.VisibleSpace = maxNodes
+		scrollV.TotalSpace = #tree + 1
+		scrollH.VisibleSpace = maxX
+		scrollH.TotalSpace = totalWidth
+
+		scrollV.Gui.Visible = #tree + 1 > maxNodes
+		scrollH.Gui.Visible = totalWidth > maxX
+
+		local oldSize = treeFrame.Size
+		treeFrame.Size = UDim2.new(1,(scrollV.Gui.Visible and -16 or 0),1,(scrollH.Gui.Visible and -39 or -23))
+		if oldSize ~= treeFrame.Size then
+			Explorer.UpdateView()
+		else
+			scrollV:Update()
+			scrollH:Update()
+
+			renameBox.Size = UDim2.new(0,maxX-100,0,16)
+
+			if scrollV.Gui.Visible and scrollH.Gui.Visible then
+				scrollV.Gui.Size = UDim2.new(0,16,1,-39)
+				scrollH.Gui.Size = UDim2.new(1,-16,0,16)
+				Explorer.Window.GuiElems.Content.ScrollCorner.Visible = true
+			else
+				scrollV.Gui.Size = UDim2.new(0,16,1,-23)
+				scrollH.Gui.Size = UDim2.new(1,0,0,16)
+				Explorer.Window.GuiElems.Content.ScrollCorner.Visible = false
+			end
+
+			Explorer.Index = scrollV.Index
+		end
+	end
+
+	Explorer.NodeSorter = function(a,b)
+		if a.Del or b.Del then return false end -- Ghost node
+
+		local aClass = a.Class
+		local bClass = b.Class
+		if not aClass then aClass = a.Obj.ClassName a.Class = aClass end
+		if not bClass then bClass = b.Obj.ClassName b.Class = bClass end
+
+		local aOrder = explorerOrders[aClass]
+		local bOrder = explorerOrders[bClass]
+		if not aOrder then aOrder = RMD.Classes[aClass] and tonumber(RMD.Classes[aClass].ExplorerOrder) or 9999 explorerOrders[aClass] = aOrder end
+		if not bOrder then bOrder = RMD.Classes[bClass] and tonumber(RMD.Classes[bClass].ExplorerOrder) or 9999 explorerOrders[bClass] = bOrder end
+
+		if aOrder ~= bOrder then
+			return aOrder < bOrder
+		else
+			local aName,bName = tostring(a.Obj),tostring(b.Obj)
+			if aName ~= bName then
+				return aName < bName
+			elseif aClass ~= bClass then
+				return aClass < bClass
+			else
+				local aId = a.Id if not aId then aId = idCounter idCounter = (idCounter+0.001)%999999999 a.Id = aId end
+				local bId = b.Id if not bId then bId = idCounter idCounter = (idCounter+0.001)%999999999 b.Id = bId end
+				return aId < bId
+			end
+		end
+	end
+
+	Explorer.Update = function()
+		table.clear(tree)
+		local maxNameWidth,maxDepth,count = 0,1,1
+		local nameCache = {}
+		local font = Enum.Font.SourceSans
+		local size = Vector2.new(math.huge,20)
+		local useNameWidth = Settings.Explorer.UseNameWidth
+		local tSort = table.sort
+		local sortFunc = Explorer.NodeSorter
+		local isSearching = (expanded == Explorer.SearchExpanded)
+		local textServ = service.TextService
+
+		local function recur(root,depth)
+			if depth > maxDepth then maxDepth = depth end
+			depth = depth + 1
+			if sortingEnabled and not root.Sorted then
+				tSort(root,sortFunc)
+				root.Sorted = true
+			end
+			for i = 1,#root do
+				local n = root[i]
+
+				if (isSearching and not searchResults[n]) or n.Del then continue end
+
+				if useNameWidth then
+					local nameWidth = n.NameWidth
+					if not nameWidth then
+						local objName = tostring(n.Obj)
+						nameWidth = nameCache[objName]
+						if not nameWidth then
+							nameWidth = getTextSize(textServ,objName,14,font,size).X
+							nameCache[objName] = nameWidth
+						end
+						n.NameWidth = nameWidth
+					end
+					if nameWidth > maxNameWidth then
+						maxNameWidth = nameWidth
+					end
+				end
+
+				tree[count] = n
+				count = count + 1
+				if expanded[n] and #n > 0 then
+					recur(n,depth)
+				end
+			end
+		end
+
+		recur(nodes[game],1)
+
+		-- Nil Instances
+		if env.getnilinstances then
+			if not (isSearching and not searchResults[nilNode]) then
+				tree[count] = nilNode
+				count = count + 1
+				if expanded[nilNode] then
+					recur(nilNode,2)
+				end
+			end
+		end
+
+		Explorer.MaxNameWidth = maxNameWidth
+		Explorer.MaxDepth = maxDepth
+		Explorer.ViewWidth = useNameWidth and Explorer.EntryIndent*maxDepth + maxNameWidth + 26 or Explorer.EntryIndent*maxDepth + 226
+		Explorer.UpdateView()
+	end
+
+	Explorer.StartDrag = function(offX,offY)
+		if Explorer.Dragging then return end
+		for i,v in next, selection.List do
+			local Obj = v.Obj
+			if Obj.Parent == game or Obj:IsA("Player") then
+				return
+			end
+		end
+		Explorer.Dragging = true
+
+		local dragTree = treeFrame:Clone()
+		dragTree:ClearAllChildren()
+
+		for i,v in pairs(listEntries) do
+			local node = tree[i + Explorer.Index]
+			if node and selection.Map[node] then
+				local clone = v:Clone()
+				clone.Active = false
+				clone.Indent.Expand.Visible = false
+				clone.Parent = dragTree
+			end
+		end
+
+		local newGui = Instance.new("ScreenGui")
+		newGui.DisplayOrder = Main.DisplayOrders.Menu
+		dragTree.Parent = newGui
+		Lib.ShowGui(newGui)
+
+		local dragOutline = create({
+			{1,"Frame",{BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,Name="DragSelect",Size=UDim2.new(1,0,1,0),}},
+			{2,"Frame",{BackgroundColor3=Color3.new(1,1,1),BorderSizePixel=0,Name="Line",Parent={1},Size=UDim2.new(1,0,0,1),ZIndex=2,}},
+			{3,"Frame",{BackgroundColor3=Color3.new(1,1,1),BorderSizePixel=0,Name="Line",Parent={1},Position=UDim2.new(0,0,1,-1),Size=UDim2.new(1,0,0,1),ZIndex=2,}},
+			{4,"Frame",{BackgroundColor3=Color3.new(1,1,1),BorderSizePixel=0,Name="Line",Parent={1},Size=UDim2.new(0,1,1,0),ZIndex=2,}},
+			{5,"Frame",{BackgroundColor3=Color3.new(1,1,1),BorderSizePixel=0,Name="Line",Parent={1},Position=UDim2.new(1,-1,0,0),Size=UDim2.new(0,1,1,0),ZIndex=2,}},
+		})
+		dragOutline.Parent = treeFrame
+
+		local mouse = Main.Mouse or service.Players.LocalPlayer:GetMouse()
+		local function move()
+			local posX = mouse.X - offX
+			local posY = mouse.Y - offY
+			dragTree.Position = UDim2.new(0,posX,0,posY)
+
+			for i = 1,#listEntries do
+				local entry = listEntries[i]
+				if Lib.CheckMouseInGui(entry) then
+					dragOutline.Position = UDim2.new(0,entry.Indent.Position.X.Offset-scrollH.Index,0,entry.Position.Y.Offset)
+					dragOutline.Size = UDim2.new(0,entry.Size.X.Offset-entry.Indent.Position.X.Offset,0,20)
+					dragOutline.Visible = true
+					return
+				end
+			end
+			dragOutline.Visible = false
+		end
+		move()
+
+		local input = service.UserInputService
+		local mouseEvent,releaseEvent
+
+		mouseEvent = input.InputChanged:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+				move()
+			end
+		end)
+
+		releaseEvent = input.InputEnded:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				releaseEvent:Disconnect()
+				mouseEvent:Disconnect()
+				newGui:Destroy()
+				dragOutline:Destroy()
+				Explorer.Dragging = false
+
+				for i = 1,#listEntries do
+					if Lib.CheckMouseInGui(listEntries[i]) then
+						local node = tree[i + Explorer.Index]
+						if node then
+							if selection.Map[node] then return end
+							local newPar = node.Obj
+							local sList = selection.List
+							for i = 1,#sList do
+								local n = sList[i]
+								pcall(function() n.Obj.Parent = newPar end)
+							end
+							Explorer.ViewNode(sList[1])
+						end
+						break
+					end
+				end
+			end
+		end)
+	end
+
+	Explorer.NewListEntry = function(index)
+		local newEntry = entryTemplate:Clone()
+		newEntry.Position = UDim2.new(0,0,0,20*(index-1))
+
+		local isRenaming = false
+
+		newEntry.InputBegan:Connect(function(input)
+			local node = tree[index + Explorer.Index]
+			if not node or selection.Map[node] or (input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch) then return end
+
+			newEntry.Indent.BackgroundColor3 = Settings.Theme.Button
+			newEntry.Indent.BorderSizePixel = 0
+			newEntry.Indent.BackgroundTransparency = 0
+		end)
+
+		newEntry.InputEnded:Connect(function(input)
+			local node = tree[index + Explorer.Index]
+			if not node or selection.Map[node] or (input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch) then return end
+
+			newEntry.Indent.BackgroundTransparency = 1
+		end)
+
+		newEntry.MouseButton1Down:Connect(function()
+
+		end)
+
+		newEntry.MouseButton1Up:Connect(function()
+
+		end)
+
+		newEntry.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				local releaseEvent, mouseEvent
+
+				local mouse = Main.Mouse or plr:GetMouse()
+				local startX, startY
+
+				if input.UserInputType == Enum.UserInputType.Touch then
+					startX = input.Position.X
+					startY = input.Position.Y
+				else
+					startX = mouse.X
+					startY = mouse.Y
+				end
+
+				local listOffsetX = startX - treeFrame.AbsolutePosition.X
+				local listOffsetY = startY - treeFrame.AbsolutePosition.Y
+
+				releaseEvent = service.UserInputService.InputEnded:Connect(function(input)
+					if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+						releaseEvent:Disconnect()
+						mouseEvent:Disconnect()
+					end
+				end)
+
+				mouseEvent = service.UserInputService.InputChanged:Connect(function(input)
+					if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+						local currentX, currentY
+
+						if input.UserInputType == Enum.UserInputType.Touch then
+							currentX = input.Position.X
+							currentY = input.Position.Y
+						else
+							currentX = mouse.X
+							currentY = mouse.Y
+						end
+
+						local deltaX = currentX - startX
+						local deltaY = currentY - startY
+						local dist = math.sqrt(deltaX^2 + deltaY^2)
+
+						if dist > 5 then
+							releaseEvent:Disconnect()
+							mouseEvent:Disconnect()
+							isRenaming = false
+							Explorer.StartDrag(listOffsetX, listOffsetY)
+						end
+					end
+				end)
+			end
+		end)
+
+		newEntry.MouseButton2Down:Connect(function()
+
+		end)
+
+		newEntry.Indent.Expand.InputBegan:Connect(function(input)
+			local node = tree[index + Explorer.Index]
+			if not node or (input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch) then return end
+
+			if input.UserInputType == Enum.UserInputType.Touch then
+				Explorer.MiscIcons:DisplayByKey(newEntry.Indent.Expand.Icon, expanded[node] and "Collapse_Over" or "Expand_Over")
+			elseif input.UserInputType == Enum.UserInputType.MouseMovement then
+				Explorer.MiscIcons:DisplayByKey(newEntry.Indent.Expand.Icon, expanded[node] and "Collapse_Over" or "Expand_Over")
+			end
+		end)
+
+		newEntry.Indent.Expand.InputEnded:Connect(function(input)
+			local node = tree[index + Explorer.Index]
+			if not node or (input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch) then return end
+
+			if input.UserInputType == Enum.UserInputType.Touch then
+				Explorer.MiscIcons:DisplayByKey(newEntry.Indent.Expand.Icon, expanded[node] and "Collapse" or "Expand")
+			elseif input.UserInputType == Enum.UserInputType.MouseMovement then
+				Explorer.MiscIcons:DisplayByKey(newEntry.Indent.Expand.Icon, expanded[node] and "Collapse" or "Expand")
+			end
+		end)
+
+		newEntry.Indent.Expand.MouseButton1Down:Connect(function()
+			local node = tree[index + Explorer.Index]
+			if not node or #node == 0 then return end
+
+			expanded[node] = not expanded[node]
+			Explorer.Update()
+			Explorer.Refresh()
+		end)
+
+		newEntry.Parent = treeFrame
+		return newEntry
+	end
+
+	Explorer.Refresh = function()
+		local maxNodes = math.max(math.ceil((treeFrame.AbsoluteSize.Y) / 20), 0)	
+		local renameNodeVisible = false
+		local isa = game.IsA
+
+		for i = 1,maxNodes do
+			local entry = listEntries[i]
+			if not listEntries[i] then entry = Explorer.NewListEntry(i) listEntries[i] = entry Explorer.ClickSystem:Add(entry) end
+
+			local node = tree[i + Explorer.Index]
+			if node then
+				local obj = node.Obj
+				local depth = Explorer.EntryIndent*Explorer.NodeDepth(node)
+
+				entry.Visible = true
+				entry.Position = UDim2.new(0,-scrollH.Index,0,entry.Position.Y.Offset)
+				entry.Size = UDim2.new(0,Explorer.ViewWidth,0,20)
+				entry.Indent.EntryName.Text = tostring(node.Obj)
+				entry.Indent.Position = UDim2.new(0,depth,0,0)
+				entry.Indent.Size = UDim2.new(1,-depth,1,0)
+
+				entry.Indent.EntryName.TextTruncate = (Settings.Explorer.UseNameWidth and Enum.TextTruncate.None or Enum.TextTruncate.AtEnd)
+
+				Explorer.MiscIcons:DisplayExplorerIcons(entry.Indent.Icon, obj.ClassName)
+
+				if selection.Map[node] then
+					entry.Indent.BackgroundColor3 = Settings.Theme.ListSelection
+					entry.Indent.BorderSizePixel = 0
+					entry.Indent.BackgroundTransparency = 0
+				else
+					if Lib.CheckMouseInGui(entry) then
+						entry.Indent.BackgroundColor3 = Settings.Theme.Button
+					else
+						entry.Indent.BackgroundTransparency = 1
+					end
+				end
+
+				if node == renamingNode then
+					renameNodeVisible = true
+					renameBox.Position = UDim2.new(0,depth+25-scrollH.Index,0,entry.Position.Y.Offset+2)
+					renameBox.Visible = true
+				end
+
+				if #node > 0 and expanded[node] ~= 0 then
+					if Lib.CheckMouseInGui(entry.Indent.Expand) then
+						Explorer.MiscIcons:DisplayByKey(entry.Indent.Expand.Icon, expanded[node] and "Collapse_Over" or "Expand_Over")
+					else
+						Explorer.MiscIcons:DisplayByKey(entry.Indent.Expand.Icon, expanded[node] and "Collapse" or "Expand")
+					end
+					entry.Indent.Expand.Visible = true
+				else
+					entry.Indent.Expand.Visible = false
+				end
+			else
+				entry.Visible = false
+			end
+		end
+
+		if not renameNodeVisible then
+			renameBox.Visible = false
+		end
+
+		for i = maxNodes+1, #listEntries do
+			Explorer.ClickSystem:Remove(listEntries[i])
+			listEntries[i]:Destroy()
+			listEntries[i] = nil
+		end
+	end
+
+	Explorer.PerformUpdate = function(instant)
+		updateDebounce = true
+		Lib.FastWait(not instant and 0.1)
+		if not updateDebounce then return end
+		updateDebounce = false
+		if not Explorer.Window:IsVisible() then return end
+		Explorer.Update()
+		Explorer.Refresh()
+	end
+
+	Explorer.ForceUpdate = function(norefresh)
+		updateDebounce = false
+		Explorer.Update()
+		if not norefresh then Explorer.Refresh() end
+	end
+
+	Explorer.PerformRefresh = function()
+		refreshDebounce = true
+		Lib.FastWait(0.1)
+		refreshDebounce = false
+		if updateDebounce or not Explorer.Window:IsVisible() then return end
+		Explorer.Refresh()
+	end
+
+	Explorer.IsNodeVisible = function(node)
+		if not node then return end
+
+		local curNode = node.Parent
+		while curNode do
+			if not expanded[curNode] then return false end
+			curNode = curNode.Parent
+		end
+		return true
+	end
+
+	Explorer.NodeDepth = function(node)
+		local depth = 0
+
+		if node == nilNode then
+			return 1
+		end
+
+		local curNode = node.Parent
+		while curNode do
+			if curNode == nilNode then depth = depth + 1 end
+			curNode = curNode.Parent
+			depth = depth + 1
+		end
+		return depth
+	end
+
+	Explorer.SetupConnections = function()
+		if descendantAddedCon then descendantAddedCon:Disconnect() end
+		if descendantRemovingCon then descendantRemovingCon:Disconnect() end
+		if itemChangedCon then itemChangedCon:Disconnect() end
+
+		if Main.Elevated then
+			descendantAddedCon = game.DescendantAdded:Connect(addObject)
+			descendantRemovingCon = game.DescendantRemoving:Connect(removeObject)
+		else
+			descendantAddedCon = game.DescendantAdded:Connect(function(obj) pcall(addObject,obj) end)
+			descendantRemovingCon = game.DescendantRemoving:Connect(function(obj) pcall(removeObject,obj) end)
+		end
+
+		if Settings.Explorer.UseNameWidth then
+			itemChangedCon = game.ItemChanged:Connect(function(obj,prop)
+				if prop == "Parent" and nodes[obj] then
+					moveObject(obj)
+				elseif prop == "Name" and nodes[obj] then
+					nodes[obj].NameWidth = nil
+				end
+			end)
+		else
+			itemChangedCon = game.ItemChanged:Connect(function(obj,prop)
+				if prop == "Parent" and nodes[obj] then
+					moveObject(obj)
+				end
+			end)
+		end
+	end
+
+	Explorer.ViewNode = function(node)
+		if not node then return end
+
+		Explorer.MakeNodeVisible(node)
+		Explorer.ForceUpdate(true)
+		local visibleSpace = scrollV.VisibleSpace
+
+		for i,v in next,tree do
+			if v == node then
+				local relative = i - 1
+				if Explorer.Index > relative then
+					scrollV.Index = relative
+				elseif Explorer.Index + visibleSpace - 1 <= relative then
+					scrollV.Index = relative - visibleSpace + 2
+				end
+			end
+		end
+
+		scrollV:Update() Explorer.Index = scrollV.Index
+		Explorer.Refresh()
+	end
+
+	Explorer.ViewObj = function(obj)
+		Explorer.ViewNode(nodes[obj])
+	end
+
+	Explorer.MakeNodeVisible = function(node,expandRoot)
+		if not node then return end
+
+		local hasExpanded = false
+
+		if expandRoot and not expanded[node] then
+			expanded[node] = true
+			hasExpanded = true
+		end
+
+		local currentNode = node.Parent
+		while currentNode do
+			hasExpanded = true
+			expanded[currentNode] = true
+			currentNode = currentNode.Parent
+		end
+
+		if hasExpanded and not updateDebounce then
+			coroutine.wrap(Explorer.PerformUpdate)(true)
+		end
+	end
+
+	Explorer.ShowRightClick = function(MousePos)
+		local Mouse = MousePos or Main.Mouse
+		local context = Explorer.RightClickContext
+		local absoluteSize = context.Gui.AbsoluteSize
+		context.MaxHeight = (absoluteSize.Y <= 600 and (absoluteSize.Y - 40)) or nil
+		context:Clear()
+
+		local sList = selection.List
+		local sMap = selection.Map
+		local emptyClipboard = #clipboard == 0
+		local presentClasses = {}
+		local apiClasses = API.Classes
+
+		for i = 1, #sList do
+			local node = sList[i]
+			local class = node.Class
+			local obj = node.Obj
+
+			if not presentClasses.isViableDecompileScript then
+				presentClasses.isViableDecompileScript = env.isViableDecompileScript(obj)
+			end
+			if not class then
+				class = obj.ClassName
+				node.Class = class
+			end
+
+			local curClass = apiClasses[class]
+			while curClass and not presentClasses[curClass.Name] do
+				presentClasses[curClass.Name] = true
+				curClass = curClass.Superclass
+			end
+		end
+
+		context:AddRegistered("CUT")
+		context:AddRegistered("COPY")
+		context:AddRegistered("PASTE", emptyClipboard)
+		context:AddRegistered("DUPLICATE")
+		context:AddRegistered("DELETE")
+		context:AddRegistered("DELETE_CHILDREN", #sList ~= 1)
+		context:AddRegistered("RENAME", #sList ~= 1)
+
+		context:AddDivider()
+		context:AddRegistered("GROUP")
+		context:AddRegistered("UNGROUP")
+		context:AddRegistered("SELECT_CHILDREN")
+		context:AddRegistered("JUMP_TO_PARENT")
+		context:AddRegistered("EXPAND_ALL")
+		context:AddRegistered("COLLAPSE_ALL")
+
+		context:AddDivider()
+
+		if expanded == Explorer.SearchExpanded then context:AddRegistered("CLEAR_SEARCH_AND_JUMP_TO") end
+		if env.setclipboard then context:AddRegistered("COPY_PATH") end
+		context:AddRegistered("INSERT_OBJECT")
+		context:AddRegistered("SAVE_INST")
+		-- context:AddRegistered("CALL_FUNCTION")
+		-- context:AddRegistered("VIEW_CONNECTIONS")
+		-- context:AddRegistered("GET_REFERENCES")
+		context:AddRegistered("COPY_API_PAGE")
+
+		context:QueueDivider()
+
+		if presentClasses["BasePart"] or presentClasses["Model"] then
+			context:AddRegistered("TELEPORT_TO")
+			context:AddRegistered("VIEW_OBJECT")
+			context:AddRegistered("3DVIEW_MODEL")
+		end
+		if presentClasses["Tween"] then context:AddRegistered("PLAY_TWEEN") end
+		if presentClasses["Animation"] then
+			context:AddRegistered("LOAD_ANIMATION")
+			context:AddRegistered("STOP_ANIMATION")
+		end
+
+		if presentClasses["TouchTransmitter"] then context:AddRegistered("FIRE_TOUCHTRANSMITTER", firetouchinterest == nil) end
+		if presentClasses["ClickDetector"] then context:AddRegistered("FIRE_CLICKDETECTOR", fireclickdetector == nil) end
+		if presentClasses["ProximityPrompt"] then context:AddRegistered("FIRE_PROXIMITYPROMPT", fireproximityprompt == nil) end
+		
+		
+		if presentClasses["RemoteEvent"] then context:AddRegistered("BLOCK_REMOTE", env.hookfunction == nil) end
+		if presentClasses["RemoteEvent"] then context:AddRegistered("UNBLOCK_REMOTE", env.hookfunction == nil) end
+		
+		if presentClasses["RemoteFunction"] then context:AddRegistered("BLOCK_REMOTE", env.hookfunction == nil) end
+		if presentClasses["RemoteFunction"] then context:AddRegistered("UNBLOCK_REMOTE", env.hookfunction == nil) end
+
+		if presentClasses["UnreliableRemoteEvent"] then context:AddRegistered("BLOCK_REMOTE", env.hookfunction == nil) end
+		if presentClasses["UnreliableRemoteEvent"] then context:AddRegistered("UNBLOCK_REMOTE", env.hookfunction == nil) end
+		
+		
+		if presentClasses["BindableEvent"] then context:AddRegistered("BLOCK_REMOTE", env.hookfunction == nil) end
+		if presentClasses["BindableEvent"] then context:AddRegistered("UNBLOCK_REMOTE", env.hookfunction == nil) end
+		
+		if presentClasses["BindableFunction"] then context:AddRegistered("BLOCK_REMOTE", env.hookfunction == nil) end
+		if presentClasses["BindableFunction"] then context:AddRegistered("UNBLOCK_REMOTE", env.hookfunction == nil) end
+		
+		
+		
+		if presentClasses["Player"] then context:AddRegistered("SELECT_CHARACTER")context:AddRegistered("VIEW_PLAYER") end
+		if presentClasses["Players"] then
+			context:AddRegistered("SELECT_LOCAL_PLAYER")
+			context:AddRegistered("SELECT_ALL_CHARACTERS")
+		end
+
+		if presentClasses["LuaSourceContainer"] then
+			context:AddRegistered("VIEW_SCRIPT", not presentClasses.isViableDecompileScript or not env.isdecompile)
+			context:AddRegistered("DUMP_FUNCTIONS", not presentClasses.isViableDecompileScript or env.getupvalues == nil or env.getconstants == nil)
+			context:AddRegistered("SAVE_SCRIPT", not presentClasses.isViableDecompileScript or not env.isdecompile or env.writefile == nil)
+			context:AddRegistered("SAVE_BYTECODE", not presentClasses.isViableDecompileScript or env.getscriptbytecode == nil or env.writefile == nil)
+
+		end
+
+		if sMap[nilNode] then
+			context:AddRegistered("REFRESH_NIL")
+			context:AddRegistered("HIDE_NIL")
+		end
+
+		Explorer.LastRightClickX, Explorer.LastRightClickY = Mouse.X, Mouse.Y
+		context:Show(Mouse.X, Mouse.Y)
+	end
+
+	Explorer.InitRightClick = function()
+		local context = Lib.ContextMenu.new()
+
+		context:Register("CUT",{Name = "Cut", IconMap = Explorer.MiscIcons, Icon = "Cut", DisabledIcon = "Cut_Disabled", Shortcut = "Ctrl+Z", OnClick = function()
+			local destroy,clone = game.Destroy,game.Clone
+			local sList,newClipboard = selection.List,{}
+			local count = 1
+			for i = 1,#sList do
+				local inst = sList[i].Obj
+				local s,cloned = pcall(clone,inst)
+				if s and cloned then
+					newClipboard[count] = cloned
+					count = count + 1
+				end
+				pcall(destroy,inst)
+			end
+			clipboard = newClipboard
+			selection:Clear()
+		end})
+
+		context:Register("COPY",{Name = "Copy", IconMap = Explorer.MiscIcons, Icon = "Copy", DisabledIcon = "Copy_Disabled", Shortcut = "Ctrl+C", OnClick = function()
+			local clone = game.Clone
+			local sList,newClipboard = selection.List,{}
+			local count = 1
+			for i = 1,#sList do
+				local inst = sList[i].Obj
+				local s,cloned = pcall(clone,inst)
+				if s and cloned then
+					newClipboard[count] = cloned
+					count = count + 1
+				end
+			end
+			clipboard = newClipboard
+		end})
+
+		context:Register("PASTE",{Name = "Paste Into", IconMap = Explorer.MiscIcons, Icon = "Paste", DisabledIcon = "Paste_Disabled", Shortcut = "Ctrl+Shift+V", OnClick = function()
+			local sList = selection.List
+			local newSelection = {}
+			local count = 1
+			for i = 1,#sList do
+				local node = sList[i]
+				local inst = node.Obj
+				Explorer.MakeNodeVisible(node,true)
+				for c = 1,#clipboard do
+					local cloned = clipboard[c]:Clone()
+					if cloned then
+						cloned.Parent = inst
+						local clonedNode = nodes[cloned]
+						if clonedNode then newSelection[count] = clonedNode count = count + 1 end
+					end
+				end
+			end
+			selection:SetTable(newSelection)
+
+			if #newSelection > 0 then
+				Explorer.ViewNode(newSelection[1])
+			end
+		end})
+
+		context:Register("DUPLICATE",{Name = "Duplicate", IconMap = Explorer.MiscIcons, Icon = "Copy", DisabledIcon = "Copy_Disabled", Shortcut = "Ctrl+D", OnClick = function()
+			local clone = game.Clone
+			local sList = selection.List
+			local newSelection = {}
+			local count = 1
+			for i = 1,#sList do
+				local node = sList[i]
+				local inst = node.Obj
+				local instPar = node.Parent and node.Parent.Obj
+				Explorer.MakeNodeVisible(node)
+				local s,cloned = pcall(clone,inst)
+				if s and cloned then
+					cloned.Parent = instPar
+					local clonedNode = nodes[cloned]
+					if clonedNode then newSelection[count] = clonedNode count = count + 1 end
+				end
+			end
+
+			selection:SetTable(newSelection)
+			if #newSelection > 0 then
+				Explorer.ViewNode(newSelection[1])
+			end
+		end})
+
+		context:Register("DELETE",{Name = "Delete", IconMap = Explorer.MiscIcons, Icon = "Delete", DisabledIcon = "Delete_Disabled", Shortcut = "Del", OnClick = function()
+			local destroy = game.Destroy
+			local sList = selection.List
+			for i = 1,#sList do
+				pcall(destroy,sList[i].Obj)
+			end
+			selection:Clear()
+		end})
+		
+		context:Register("DELETE_CHILDREN",{Name = "Delete Children", IconMap = Explorer.MiscIcons, Icon = "Delete", DisabledIcon = "Delete_Disabled", Shortcut = "Shift+Del", OnClick = function()
+			local sList = selection.List
+			for i = 1,#sList do
+				pcall(sList[i].Obj.ClearAllChildren,sList[i].Obj)
+			end
+			selection:Clear()
+		end})
+		context:Register("RENAME",{Name = "Rename", IconMap = Explorer.MiscIcons, Icon = "Rename", DisabledIcon = "Rename_Disabled", Shortcut = "F2", OnClick = function()
+			local sList = selection.List
+			if sList[1] then
+				Explorer.SetRenamingNode(sList[1])
+			end
+		end})
+
+		context:Register("GROUP",{Name = "Group", IconMap = Explorer.MiscIcons, Icon = "Group", DisabledIcon = "Group_Disabled", Shortcut = "Ctrl+G", OnClick = function()
+			local sList = selection.List
+			if #sList == 0 then return end
+
+			local model = Instance.new("Model",sList[#sList].Obj.Parent)
+			for i = 1,#sList do
+				pcall(function() sList[i].Obj.Parent = model end)
+			end
+
+			if nodes[model] then
+				selection:Set(nodes[model])
+				Explorer.ViewNode(nodes[model])
+			end
+		end})
+
+		context:Register("UNGROUP",{Name = "Ungroup", IconMap = Explorer.MiscIcons, Icon = "Ungroup", DisabledIcon = "Ungroup_Disabled", Shortcut = "Ctrl+U", OnClick = function()
+			local newSelection = {}
+			local count = 1
+			local isa = game.IsA
+
+			local function ungroup(node)
+				local par = node.Parent.Obj
+				local ch = {}
+				local chCount = 1
+
+				for i = 1,#node do
+					local n = node[i]
+					newSelection[count] = n
+					ch[chCount] = n
+					count = count + 1
+					chCount = chCount + 1
+				end
+
+				for i = 1,#ch do
+					pcall(function() ch[i].Obj.Parent = par end)
+				end
+
+				node.Obj:Destroy()
+			end
+
+			for i,v in next,selection.List do
+				if isa(v.Obj,"Model") then
+					ungroup(v)
+				end
+			end
+
+			selection:SetTable(newSelection)
+			if #newSelection > 0 then
+				Explorer.ViewNode(newSelection[1])
+			end
+		end})
+
+		context:Register("SELECT_CHILDREN",{Name = "Select Children", IconMap = Explorer.MiscIcons, Icon = "SelectChildren", DisabledIcon = "SelectChildren_Disabled", OnClick = function()
+			local newSelection = {}
+			local count = 1
+			local sList = selection.List
+
+			for i = 1,#sList do
+				local node = sList[i]
+				for ind = 1,#node do
+					local cNode = node[ind]
+					if ind == 1 then Explorer.MakeNodeVisible(cNode) end
+
+					newSelection[count] = cNode
+					count = count + 1
+				end
+			end
+
+			selection:SetTable(newSelection)
+			if #newSelection > 0 then
+				Explorer.ViewNode(newSelection[1])
+			else
+				Explorer.Refresh()
+			end
+		end})
+
+		context:Register("JUMP_TO_PARENT",{Name = "Jump to Parent", IconMap = Explorer.MiscIcons, Icon = "JumpToParent", OnClick = function()
+			local newSelection = {}
+			local count = 1
+			local sList = selection.List
+
+			for i = 1,#sList do
+				local node = sList[i]
+				if node.Parent then
+					newSelection[count] = node.Parent
+					count = count + 1
+				end
+			end
+
+			selection:SetTable(newSelection)
+			if #newSelection > 0 then
+				Explorer.ViewNode(newSelection[1])
+			else
+				Explorer.Refresh()
+			end
+		end})
+
+		context:Register("TELEPORT_TO",{Name = "Teleport To", IconMap = Explorer.MiscIcons, Icon = "TeleportTo", OnClick = function()
+			local sList = selection.List
+			local plrRP = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+
+			if not plrRP then return end
+
+			for _,node in next, sList do
+				local Obj = node.Obj
+
+				if Obj:IsA("BasePart") then
+					if Obj.CanCollide then
+						plr.Character:MoveTo(Obj.Position)
+					else
+						plrRP.CFrame = CFrame.new(Obj.Position + Settings.Explorer.TeleportToOffset)
+					end
+					break
+				elseif Obj:IsA("Model") then
+					if Obj.PrimaryPart then
+						if Obj.PrimaryPart.CanCollide then
+							plr.Character:MoveTo(Obj.PrimaryPart.Position)
+						else
+							plrRP.CFrame = CFrame.new(Obj.PrimaryPart.Position + Settings.Explorer.TeleportToOffset)
+						end
+						break
+					else
+						local part = Obj:FindFirstChildWhichIsA("BasePart", true)
+						if part and nodes[part] then
+							if part.CanCollide then
+								plr.Character:MoveTo(part.Position)
+							else
+								plrRP.CFrame = CFrame.new(part.Position + Settings.Explorer.TeleportToOffset)
+							end
+							break
+						elseif Obj.WorldPivot then
+							plrRP.CFrame = Obj.WorldPivot
+						end
+					end
+				end
+			end
+		end})
+
+		local OldAnimation
+		context:Register("PLAY_TWEEN",{Name = "Play Tween", IconMap = Explorer.MiscIcons, Icon = "Play", OnClick = function()
+			local sList = selection.List
+
+			for i = 1, #sList do
+				local node = sList[i]
+				local Obj = node.Obj
+
+				if Obj:IsA("Tween") then Obj:Play() end
+			end
+		end})
+
+		local OldAnimation
+		context:Register("LOAD_ANIMATION",{Name = "Load Animation", IconMap = Explorer.MiscIcons, Icon = "Play", OnClick = function()
+			local sList = selection.List
+
+			local Humanoid = plr.Character and plr.Character:FindFirstChild("Humanoid")
+			if not Humanoid then return end
+
+			for i = 1, #sList do
+				local node = sList[i]
+				local Obj = node.Obj
+
+				if Obj:IsA("Animation") then
+					if OldAnimation then OldAnimation:Stop() end
+					OldAnimation = Humanoid:LoadAnimation(Obj)
+					OldAnimation:Play()
+					break
+				end
+			end
+		end})
+
+		context:Register("STOP_ANIMATION",{Name = "Stop Animation", IconMap = Explorer.MiscIcons, Icon = "Pause", OnClick = function()
+			local sList = selection.List
+
+			local Humanoid = plr.Character and plr.Character:FindFirstChild("Humanoid")
+			if not Humanoid then return end
+
+			for i = 1, #sList do
+				local node = sList[i]
+				local Obj = node.Obj
+
+				if Obj:IsA("Animation") then
+					if OldAnimation then OldAnimation:Stop() end
+					Humanoid:LoadAnimation(Obj):Stop()
+					break
+				end
+			end
+		end})
+
+		context:Register("EXPAND_ALL",{Name = "Expand All", OnClick = function()
+			local sList = selection.List
+
+			local function expand(node)
+				expanded[node] = true
+				for i = 1,#node do
+					if #node[i] > 0 then
+						expand(node[i])
+					end
+				end
+			end
+
+			for i = 1,#sList do
+				expand(sList[i])
+			end
+
+			Explorer.ForceUpdate()
+		end})
+
+		context:Register("COLLAPSE_ALL",{Name = "Collapse All", OnClick = function()
+			local sList = selection.List
+
+			local function expand(node)
+				expanded[node] = nil
+				for i = 1,#node do
+					if #node[i] > 0 then
+						expand(node[i])
+					end
+				end
+			end
+
+			for i = 1,#sList do
+				expand(sList[i])
+			end
+
+			Explorer.ForceUpdate()
+		end})
+
+		context:Register("CLEAR_SEARCH_AND_JUMP_TO",{Name = "Clear Search and Jump to", OnClick = function()
+			local newSelection = {}
+			local count = 1
+			local sList = selection.List
+
+			for i = 1,#sList do
+				newSelection[count] = sList[i]
+				count = count + 1
+			end
+
+			selection:SetTable(newSelection)
+			Explorer.ClearSearch()
+			if #newSelection > 0 then
+				Explorer.ViewNode(newSelection[1])
+			end
+		end})
+
+		-- this code is very bad but im lazy and it works so cope
+		local clth = function(str)
+			if str:sub(1, 28) == "game:GetService(\"Workspace\")" then str = str:gsub("game:GetService%(\"Workspace\"%)", "workspace", 1) end
+			if str:sub(1, 27 + #plr.Name) == "game:GetService(\"Players\")." .. plr.Name then str = str:gsub("game:GetService%(\"Players\"%)." .. plr.Name, "game:GetService(\"Players\").LocalPlayer", 1) end
+			return str
+		end
+
+		context:Register("COPY_PATH",{Name = "Copy Path", IconMap = Explorer.LegacyClassIcons, Icon = 50, OnClick = function()
+			local sList = selection.List
+			if #sList == 1 then
+				env.setclipboard(clth(Explorer.GetInstancePath(sList[1].Obj)))
+			elseif #sList > 1 then
+				local resList = {"{"}
+				local count = 2
+				for i = 1,#sList do
+					local path = "\t"..clth(Explorer.GetInstancePath(sList[i].Obj))..","
+					if #path > 0 then
+						resList[count] = path
+						count = count+1
+					end
+				end
+				resList[count] = "}"
+				env.setclipboard(table.concat(resList,"\n"))
+			end
+		end})
+
+		context:Register("INSERT_OBJECT",{Name = "Insert Object", IconMap = Explorer.MiscIcons, Icon = "InsertObject", OnClick = function()
+			local mouse = Main.Mouse
+			local x,y = Explorer.LastRightClickX or mouse.X, Explorer.LastRightClickY or mouse.Y
+			Explorer.InsertObjectContext:Show(x,y)
+		end})
+
+		--[[context:Register("CALL_FUNCTION",{Name = "Call Function", IconMap = Explorer.ClassIcons, Icon = 66, OnClick = function()
+
+		end})
+
+		context:Register("GET_REFERENCES",{Name = "Get Lua References", IconMap = Explorer.ClassIcons, Icon = 34, OnClick = function()
+
+		end})]]
+
+		context:Register("SAVE_INST",{Name = "Save to File", IconMap = Explorer.MiscIcons, Icon = "Save", OnClick = function()
+			local sList = selection.List
+			if #sList == 1 then
+				Lib.SaveAsPrompt("Place_"..game.PlaceId.."_"..sList[1].Obj.ClassName.."_"..sList[1].Obj.Name.."_"..os.time(), function(filename)
+					env.saveinstance(sList[1].Obj, filename, {
+						Decompile = true,
+						RemovePlayerCharacters = false
+					})
+				end)
+			elseif #sList > 1 then
+				for i = 1,#sList do
+					-- sList[i].Obj.Name.." ("..sList[1].Obj.ClassName..")"
+					-- "Place_"..game.PlaceId.."_"..sList[1].Obj.ClassName.."_"..sList[i].Obj.Name.."_"..os.time()
+					Lib.SaveAsPrompt("Place_"..game.PlaceId.."_"..sList[i].Obj.ClassName.."_"..sList[i].Obj.Name.."_"..os.time(), function(filename)
+						env.saveinstance(sList[i].Obj, filename, {
+							Decompile = true,
+							RemovePlayerCharacters = false
+						})
+					end)
+					
+					task.wait(0.1)
+				end
+			end
+		end})
+
+        --[[context:Register("VIEW_CONNECTIONS",{Name = "View Connections", OnClick = function()
+            
+        end})]]
+		local ClassFire = {
+			RemoteEvent = "FireServer",
+			RemoteFunction = "InvokeServer",
+			UnreliableRemoteEvent = "FireServer",
+
+			BindableRemote = "Fire",
+			BindableFunction = "Invoke",
+		}
+		context:Register("BLOCK_REMOTE",{Name = "Block From Firing", IconMap = Explorer.MiscIcons, Icon = "Delete", DisabledIcon = "Empty", OnClick = function()
+			local sList = selection.List
+			for i, list in sList do
+				local obj = list.Obj
+				if not remote_blocklist[obj] then
+					local functionToHook = ClassFire[obj.ClassName]
+					remote_blocklist[obj] = true
+					local old; old = env.hookmetamethod((oldgame or game), "__namecall", function(self, ...)
+						if remote_blocklist[obj] and self == obj and getnamecallmethod() == functionToHook then
+							return nil
+						end
+						return old(self,...)
+					end)
+					if Settings.RemoteBlockWriteAttribute then
+						obj:SetAttribute("IsBlocked", true)
+					end
+					--print("blocking ",functionToHook)
+				end
+			end
+		end})
+		
+		context:Register("UNBLOCK_REMOTE",{Name = "Unblock", IconMap = Explorer.MiscIcons, Icon = "Play", DisabledIcon = "Empty", OnClick = function()
+			local sList = selection.List
+			for i, list in sList do
+				local obj = list.Obj
+				if remote_blocklist[obj] then
+					remote_blocklist[obj] = nil
+					if Settings.RemoteBlockWriteAttribute then
+						list.Obj:SetAttribute("IsBlocked", false)
+					end
+					--print("unblocking ",functionToHook)
+				end
+			end
+		end})
+
+		context:Register("COPY_API_PAGE",{Name = "Copy Roblox API Page URL", IconMap = Explorer.MiscIcons, Icon = "Reference", OnClick = function()
+			local sList = selection.List
+			if #sList == 1 then
+				env.setclipboard(
+					"https://create.roblox.com/docs/reference/engine/classes/"..sList[1].Obj.ClassName
+				)
+			end
+		end})
+
+		context:Register("3DVIEW_MODEL",{Name = "3D Preview Object", IconMap = Explorer.LegacyClassIcons, Icon = 54, OnClick = function()
+			local sList = selection.List
+			local isa = game.IsA
+			
+			if #sList == 1 then
+				if isa(sList[1].Obj,"BasePart") or isa(sList[1].Obj,"Model") then
+					ModelViewer.ViewModel(sList[1].Obj)
+					return
+				end
+			end
+		end})
+		
+		context:Register("VIEW_OBJECT",{Name = "View Object (Right click to reset)", IconMap = Explorer.LegacyClassIcons, Icon = 5, OnClick = function()
+			local sList = selection.List
+			local isa = game.IsA
+
+			for i = 1,#sList do
+				local node = sList[i]
+
+				if isa(node.Obj,"BasePart") or isa(node.Obj,"Model") then
+					workspace.CurrentCamera.CameraSubject = node.Obj
+					break
+				end
+			end
+		end, OnRightClick = function()
+			workspace.CurrentCamera.CameraSubject = plr.Character
+		end})
+
+		context:Register("VIEW_SCRIPT",{Name = "View Script", IconMap = Explorer.MiscIcons, Icon = "ViewScript", DisabledIcon = "Empty", OnClick = function()
+			local scr = selection.List[1] and selection.List[1].Obj
+			if scr then ScriptViewer.ViewScript(scr) end
+		end})
+		context:Register("DUMP_FUNCTIONS",{Name = "Dump Functions", IconMap = Explorer.MiscIcons, Icon = "SelectChildren", DisabledIcon = "Empty", OnClick = function()
+			local scr = selection.List[1] and selection.List[1].Obj
+			if scr then ScriptViewer.DumpFunctions(scr) end
+		end})
+
+		context:Register("FIRE_TOUCHTRANSMITTER",{Name = "Fire TouchTransmitter", OnClick = function()
+			local hrp = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+			if not hrp then return end
+			for _, v in ipairs(selection.List) do if v.Obj and v.Obj:IsA("TouchTransmitter") then firetouchinterest(hrp, v.Obj.Parent, 0) end end
+		end})
+
+		context:Register("FIRE_CLICKDETECTOR",{Name = "Fire ClickDetector", OnClick = function()
+			local hrp = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+			if not hrp then return end
+			for _, v in ipairs(selection.List) do if v.Obj and v.Obj:IsA("ClickDetector") then fireclickdetector(v.Obj) end end
+		end})
+
+		context:Register("FIRE_PROXIMITYPROMPT",{Name = "Fire ProximityPrompt", OnClick = function()
+			local hrp = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+			if not hrp then return end
+			for _, v in ipairs(selection.List) do if v.Obj and v.Obj:IsA("ProximityPrompt") then fireproximityprompt(v.Obj) end end
+		end})
+
+		context:Register("VIEW_SCRIPT",{Name = "View Script", IconMap = Explorer.MiscIcons, Icon = "ViewScript", DisabledIcon = "Empty", OnClick = function()
+			local scr = selection.List[1] and selection.List[1].Obj
+			if scr then ScriptViewer.ViewScript(scr) end
+		end})
+
+		context:Register("SAVE_SCRIPT",{Name = "Save Script", IconMap = Explorer.MiscIcons, Icon = "Save", DisabledIcon = "Empty", OnClick = function()
+			for _, v in next, selection.List do
+				if v.Obj:IsA("LuaSourceContainer") and env.isViableDecompileScript(v.Obj) then
+					local success, source = pcall(env.decompile, v.Obj)
+					if not success or not source then source = ("-- DEX - %s failed to decompile %s"):format(env.executor, v.Obj.ClassName) end
+					local fileName = ("%s_%s_%i_Source.txt"):format(env.parsefile(v.Obj.Name), v.Obj.ClassName, game.PlaceId)
+					--env.writefile(fileName, source)
+					Lib.SaveAsPrompt(fileName, source)
+					
+					task.wait(0.2)
+				end
+			end
+		end})
+
+		context:Register("SAVE_BYTECODE",{Name = "Save Script Bytecode", IconMap = Explorer.MiscIcons, Icon = "Save", DisabledIcon = "Empty", OnClick = function()
+			for _, v in next, selection.List do
+				if v.Obj:IsA("LuaSourceContainer") and env.isViableDecompileScript(v.Obj) then
+					local success, bytecode = pcall(env.getscriptbytecode, v.Obj)
+					if success and type(bytecode) == "string" then
+						local fileName = ("%s_%s_%i_Bytecode.txt"):format(env.parsefile(v.Obj.Name), v.Obj.ClassName, game.PlaceId)
+						--env.writefile(fileName, bytecode)
+						Lib.SaveAsPrompt(fileName, bytecode)
+						task.wait(0.2)
+					end
+				end
+			end
+		end})
+
+		context:Register("SELECT_CHARACTER",{Name = "Select Character", IconMap = Explorer.LegacyClassIcons, Icon = 9, OnClick = function()
+			local newSelection = {}
+			local count = 1
+			local sList = selection.List
+			local isa = game.IsA
+
+			for i = 1,#sList do
+				local node = sList[i]
+				if isa(node.Obj,"Player") and nodes[node.Obj.Character] then
+					newSelection[count] = nodes[node.Obj.Character]
+					count = count + 1
+				end
+			end
+
+			selection:SetTable(newSelection)
+			if #newSelection > 0 then
+				Explorer.ViewNode(newSelection[1])
+			else
+				Explorer.Refresh()
+			end
+		end})
+
+		context:Register("VIEW_PLAYER",{Name = "View Player", IconMap = Explorer.LegacyClassIcons, Icon = 5, OnClick = function()
+			local newSelection = {}
+			local count = 1
+			local sList = selection.List
+			local isa = game.IsA
+
+			for i = 1,#sList do
+				local node = sList[i]
+				local Obj = node.Obj
+				if Obj:IsA("Player") and Obj.Character then
+					workspace.CurrentCamera.CameraSubject = Obj.Character
+					break
+				end
+			end
+		end})
+
+		context:Register("SELECT_LOCAL_PLAYER",{Name = "Select Local Player", IconMap = Explorer.LegacyClassIcons, Icon = 9, OnClick = function()
+			pcall(function() if nodes[plr] then selection:Set(nodes[plr]) Explorer.ViewNode(nodes[plr]) end end)
+		end})
+
+		context:Register("SELECT_ALL_CHARACTERS",{Name = "Select All Characters", IconMap = Explorer.LegacyClassIcons, Icon = 2, OnClick = function()
+			local newSelection = {}
+			local sList = selection.List
+
+			for i,v in next, service.Players:GetPlayers() do
+				if v.Character and nodes[v.Character] then
+					if i == 1 then Explorer.MakeNodeVisible(v.Character) end
+					table.insert(newSelection, nodes[v.Character])
+				end
+			end
+
+			selection:SetTable(newSelection)
+			if #newSelection > 0 then
+				Explorer.ViewNode(newSelection[1])
+			else
+				Explorer.Refresh()
+			end
+		end})
+
+		context:Register("REFRESH_NIL",{Name = "Refresh Nil Instances", OnClick = function()
+			Explorer.RefreshNilInstances()
+		end})
+
+		context:Register("HIDE_NIL",{Name = "Hide Nil Instances", OnClick = function()
+			Explorer.HideNilInstances()
+		end})
+
+		Explorer.RightClickContext = context
+	end
+
+	Explorer.HideNilInstances = function()
+		table.clear(nilMap)
+
+		local disconnectCon = Instance.new("Folder").ChildAdded:Connect(function() end).Disconnect
+		for i,v in next,nilCons do
+			disconnectCon(v[1])
+			disconnectCon(v[2])
+		end
+		table.clear(nilCons)
+
+		for i = 1,#nilNode do
+			coroutine.wrap(removeObject)(nilNode[i].Obj)
+		end
+
+		Explorer.Update()
+		Explorer.Refresh()
+	end
+
+	Explorer.RefreshNilInstances = function()
+		if not env.getnilinstances then return end
+
+		local nilInsts = env.getnilinstances()
+		local game = game
+		local getDescs = game.GetDescendants
+		--local newNilMap = {}
+		--local newNilRoots = {}
+		--local nilRoots = Explorer.NilRoots
+		--local connect = game.DescendantAdded.Connect
+		--local disconnect
+		--if not nilRoots then nilRoots = {} Explorer.NilRoots = nilRoots end
+
+		for i = 1,#nilInsts do
+			local obj = nilInsts[i]
+			if obj ~= game then
+				nilMap[obj] = true
+				--newNilRoots[obj] = true
+
+				local descs = getDescs(obj)
+				for j = 1,#descs do
+					nilMap[descs[j]] = true
+				end
+			end
+		end
+
+		-- Remove unmapped nil nodes
+		--[[for i = 1,#nilNode do
+			local node = nilNode[i]
+			if not newNilMap[node.Obj] then
+				nilMap[node.Obj] = nil
+				coroutine.wrap(removeObject)(node)
+			end
+		end]]
+
+		--nilMap = newNilMap
+
+		for i = 1,#nilInsts do
+			local obj = nilInsts[i]
+			local node = nodes[obj]
+			if not node then coroutine.wrap(addObject)(obj) end
+		end
+
+		--[[
+		-- Remove old root connections
+		for obj in next,nilRoots do
+			if not newNilRoots[obj] then
+				if not disconnect then disconnect = obj[1].Disconnect end
+				disconnect(obj[1])
+				disconnect(obj[2])
+			end
+		end
+		
+		for obj in next,newNilRoots do
+			if not nilRoots[obj] then
+				nilRoots[obj] = {
+					connect(obj.DescendantAdded,addObject),
+					connect(obj.DescendantRemoving,removeObject)
+				}
+			end
+		end]]
+
+		--nilMap = newNilMap
+		--Explorer.NilRoots = newNilRoots
+
+		Explorer.Update()
+		Explorer.Refresh()
+	end
+
+	Explorer.GetInstancePath = function(obj)
+		local ffc = game.FindFirstChild
+		local getCh = game.GetChildren
+		local path = ""
+		local curObj = obj
+		local ts = tostring
+		local match = string.match
+		local gsub = string.gsub
+		local tableFind = table.find
+		local useGetCh = Settings.Explorer.CopyPathUseGetChildren
+		local formatLuaString = Lib.FormatLuaString
+
+		while curObj do
+			if curObj == game then
+				path = "game"..path
+				break
+			end
+
+			local className = curObj.ClassName
+			local curName = ts(curObj)
+			local indexName
+			if match(curName,"^[%a_][%w_]*$") then
+				indexName = "."..curName
+			else
+				local cleanName = formatLuaString(curName)
+				indexName = '["'..cleanName..'"]'
+			end
+
+			local parObj = curObj.Parent
+			if parObj then
+				local fc = ffc(parObj,curName)
+				if useGetCh and fc and fc ~= curObj then
+					local parCh = getCh(parObj)
+					local fcInd = tableFind(parCh,curObj)
+					indexName = ":GetChildren()["..fcInd.."]"
+				elseif parObj == game and API.Classes[className] and API.Classes[className].Tags.Service then
+					indexName = ':GetService("'..className..'")'
+				end
+			elseif parObj == nil then
+				local getnil = "local getNil = function(name, class) for _, v in next, getnilinstances() do if v.ClassName == class and v.Name == name then return v end end end"
+				local gotnil = "\n\ngetNil(\"%s\", \"%s\")"
+				indexName = getnil .. gotnil:format(curObj.Name, className)
+			end
+
+			path = indexName..path
+			curObj = parObj
+		end
+
+		return path
+	end
+
+	Explorer.DefaultProps = {
+		["BasePart"] = {
+			Position = function(Obj)
+				local Player = service.Players.LocalPlayer
+				if Player.Character and Player.Character:FindFirstChild("HumanoidRootPart") then
+					Obj.Position = (Player.Character.HumanoidRootPart.CFrame * CFrame.new(0, 0, -10)).p
+				end
+				return Obj.Position
+			end,
+			Anchored = true
+		},
+		["GuiObject"] = {
+			Position = function(Obj) return (Obj.Parent:IsA("ScreenGui") and UDim2.new(0.5, 0, 0.5, 0)) or Obj.Position end,
+			Active = true
+		}
+	}
+
+	Explorer.InitInsertObject = function()
+		local context = Lib.ContextMenu.new()
+		context.SearchEnabled = true
+		context.MaxHeight = 400
+		context:ApplyTheme({
+			ContentColor = Settings.Theme.Main2,
+			OutlineColor = Settings.Theme.Outline1,
+			DividerColor = Settings.Theme.Outline1,
+			TextColor = Settings.Theme.Text,
+			HighlightColor = Settings.Theme.ButtonHover
+		})
+
+		local classes = {}
+		for i,class in next,API.Classes do
+			local tags = class.Tags
+			if not tags.NotCreatable and not tags.Service then
+				local rmdEntry = RMD.Classes[class.Name]
+				classes[#classes+1] = {class,rmdEntry and rmdEntry.ClassCategory or "Uncategorized"}
+			end
+		end
+		table.sort(classes,function(a,b)
+			if a[2] ~= b[2] then
+				return a[2] < b[2]
+			else
+				return a[1].Name < b[1].Name
+			end
+		end)
+
+		local function defaultProps(obj)
+			for class, props in pairs(Explorer.DefaultProps) do
+				if obj:IsA(class) then
+					for prop, value in pairs(props) do
+						obj[prop] = (type(value) == "function" and value(obj)) or value
+					end
+				end
+			end
+		end
+
+		local function onClick(className)
+			local sList = selection.List
+			local instNew = Instance.new
+			for i = 1,#sList do
+				local node = sList[i]
+				local obj = node.Obj
+				Explorer.MakeNodeVisible(node, true)
+				local success, obj = pcall(instNew, className, obj)
+				if success and obj then defaultProps(obj) end
+			end
+		end
+
+		local lastCategory = ""
+		for i = 1,#classes do
+			local class = classes[i][1]
+			local rmdEntry = RMD.Classes[class.Name]
+			local iconInd = rmdEntry and tonumber(rmdEntry.ExplorerImageIndex) or 0
+			local category = classes[i][2]
+
+			if lastCategory ~= category then
+				context:AddDivider(category)
+				lastCategory = category
+			end
+			
+			local icon
+			if iconData then
+				icon = iconData.Icons[class.Name] or iconData.Icons.Placeholder
+			else
+				icon = iconInd
+			end
+			context:Add({Name = class.Name, IconMap = Explorer.ClassIcons, Icon = icon, OnClick = onClick})
+		end
+
+		Explorer.InsertObjectContext = context
+	end
+	
+	--[[
+		Headers, Setups, Predicate, ObjectDefs
+	]]
+	Explorer.SearchFilters = { -- TODO: Use data table (so we can disable some if funcs don't exist)
+		Comparison = {
+			["isa"] = function(argString)
+				local lower = string.lower
+				local find = string.find
+				local classQuery = string.split(argString)[1]
+				if not classQuery then return end
+				classQuery = lower(classQuery)
+
+				local className
+				for class,_ in pairs(API.Classes) do
+					local cName = lower(class)
+					if cName == classQuery then
+						className = class
+						break
+					elseif find(cName,classQuery,1,true) then
+						className = class
+					end
+				end
+				if not className then return end
+
+				return {
+					Headers = {"local isa = game.IsA"},
+					Predicate = "isa(obj,'"..className.."')"
+				}
+			end,
+			["remotes"] = function(argString)
+				return {
+					Headers = {"local isa = game.IsA"},
+					Predicate = "isa(obj,'RemoteEvent') or isa(obj,'RemoteFunction') or isa(obj,'UnreliableRemoteEvent')"
+				}
+			end,
+			["bindables"] = function(argString)
+				return {
+					Headers = {"local isa = game.IsA"},
+					Predicate = "isa(obj,'BindableEvent') or isa(obj,'BindableFunction')"
+				}
+			end,
+			["rad"] = function(argString)
+				local num = tonumber(argString)
+				if not num then return end
+
+				if not service.Players.LocalPlayer.Character or not service.Players.LocalPlayer.Character:FindFirstChild("HumanoidRootPart") or not service.Players.LocalPlayer.Character.HumanoidRootPart:IsA("BasePart") then return end
+
+				return {
+					Headers = {"local isa = game.IsA", "local hrp = service.Players.LocalPlayer.Character.HumanoidRootPart"},
+					Setups = {"local hrpPos = hrp.Position"},
+					ObjectDefs = {"local isBasePart = isa(obj,'BasePart')"},
+					Predicate = "(isBasePart and (obj.Position-hrpPos).Magnitude <= "..num..")"
+				}
+			end,
+		},
+		Specific = {
+			["players"] = function()
+				return function() return service.Players:GetPlayers() end
+			end,
+			["loadedmodules"] = function()
+				return env.getloadedmodules
+			end,
+		},
+		Default = function(argString,caseSensitive)
+			local cleanString = argString:gsub("\"","\\\""):gsub("\n","\\n")
+			if caseSensitive then
+				return {
+					Headers = {"local find = string.find"},
+					ObjectDefs = {"local objName = tostring(obj)"},
+					Predicate = "find(objName,\"" .. cleanString .. "\",1,true)"
+				}
+			else
+				return {
+					Headers = {"local lower = string.lower","local find = string.find","local tostring = tostring"},
+					ObjectDefs = {"local lowerName = lower(tostring(obj))"},
+					Predicate = "find(lowerName,\"" .. cleanString:lower() .. "\",1,true)"
+				}
+			end
+		end,
+		SpecificDefault = function(n)
+			return {
+				Headers = {},
+				ObjectDefs = {"local isSpec"..n.." = specResults["..n.."][node]"},
+				Predicate = "isSpec"..n
+			}
+		end,
+	}
+
+	Explorer.BuildSearchFunc = function(query)
+		local specFilterList,specMap = {},{}
+		local finalPredicate = ""
+		local rep = string.rep
+		local formatQuery = query:gsub("\\.","  "):gsub('".-"',function(str) return rep(" ",#str) end)
+		local headers = {}
+		local objectDefs = {}
+		local setups = {}
+		local find = string.find
+		local sub = string.sub
+		local lower = string.lower
+		local match = string.match
+		local ops = {
+			["("] = "(",
+			[")"] = ")",
+			["||"] = " or ",
+			["&&"] = " and "
+		}
+		local filterCount = 0
+		local compFilters = Explorer.SearchFilters.Comparison
+		local specFilters = Explorer.SearchFilters.Specific
+		local init = 1
+		local lastOp = nil
+
+		local function processFilter(dat)
+			if dat.Headers then
+				local t = dat.Headers
+				for i = 1,#t do
+					headers[t[i]] = true
+				end
+			end
+
+			if dat.ObjectDefs then
+				local t = dat.ObjectDefs
+				for i = 1,#t do
+					objectDefs[t[i]] = true
+				end
+			end
+
+			if dat.Setups then
+				local t = dat.Setups
+				for i = 1,#t do
+					setups[t[i]] = true
+				end
+			end
+
+			finalPredicate = finalPredicate..dat.Predicate
+		end
+
+		local found = {}
+		local foundData = {}
+		local find = string.find
+		local sub = string.sub
+
+		local function findAll(str,pattern)
+			local count = #found+1
+			local init = 1
+			local sz = #pattern
+			local x,y,extra = find(str,pattern,init,true)
+			while x do
+				found[count] = x
+				foundData[x] = {sz,pattern}
+
+				count = count+1
+				init = y+1
+				x,y,extra = find(str,pattern,init,true)
+			end
+		end
+		local start = tick()
+		findAll(formatQuery,'&&')
+		findAll(formatQuery,"||")
+		findAll(formatQuery,"(")
+		findAll(formatQuery,")")
+		table.sort(found)
+		table.insert(found,#formatQuery+1)
+
+		local function inQuotes(str)
+			local len = #str
+			if sub(str,1,1) == '"' and sub(str,len,len) == '"' then
+				return sub(str,2,len-1)
+			end
+		end
+
+		for i = 1,#found do
+			local nextInd = found[i]
+			local nextData = foundData[nextInd] or {1}
+			local op = ops[nextData[2]]
+			local term = sub(query,init,nextInd-1)
+			term = match(term,"^%s*(.-)%s*$") or "" -- Trim
+
+			if #term > 0 then
+				if sub(term,1,1) == "!" then
+					term = sub(term,2)
+					finalPredicate = finalPredicate.."not "
+				end
+
+				local qTerm = inQuotes(term)
+				if qTerm then
+					processFilter(Explorer.SearchFilters.Default(qTerm,true))
+				else
+					local x,y = find(term,"%S+")
+					if x then
+						local first = sub(term,x,y)
+						local specifier = sub(first,1,1) == "/" and lower(sub(first,2))
+						local compFunc = specifier and compFilters[specifier]
+						local specFunc = specifier and specFilters[specifier]
+
+						if compFunc then
+							local argStr = sub(term,y+2)
+							local ret = compFunc(inQuotes(argStr) or argStr)
+							if ret then
+								processFilter(ret)
+							else
+								finalPredicate = finalPredicate.."false"
+							end
+						elseif specFunc then
+							local argStr = sub(term,y+2)
+							local ret = specFunc(inQuotes(argStr) or argStr)
+							if ret then
+								if not specMap[term] then
+									specFilterList[#specFilterList + 1] = ret
+									specMap[term] = #specFilterList
+								end
+								processFilter(Explorer.SearchFilters.SpecificDefault(specMap[term]))
+							else
+								finalPredicate = finalPredicate.."false"
+							end
+						else
+							processFilter(Explorer.SearchFilters.Default(term))
+						end
+					end
+				end				
+			end
+
+			if op then
+				finalPredicate = finalPredicate..op
+				if op == "(" and (#term > 0 or lastOp == ")") then -- Handle bracket glitch
+					return
+				else
+					lastOp = op
+				end
+			end
+			init = nextInd+nextData[1]
+		end
+
+		local finalSetups = ""
+		local finalHeaders = ""
+		local finalObjectDefs = ""
+
+		for setup,_ in next,setups do finalSetups = finalSetups..setup.."\n" end
+		for header,_ in next,headers do finalHeaders = finalHeaders..header.."\n" end
+		for oDef,_ in next,objectDefs do finalObjectDefs = finalObjectDefs..oDef.."\n" end
+
+		local template = [==[
+local searchResults = searchResults
+local nodes = nodes
+local expandTable = Explorer.SearchExpanded
+local specResults = specResults
+local service = service
+
+%s
+local function search(root)	
+%s
+	
+	local expandedpar = false
+	for i = 1,#root do
+		local node = root[i]
+		local obj = node.Obj
+		
+%s
+		
+		if %s then
+			expandTable[node] = 0
+			searchResults[node] = true
+			if not expandedpar then
+				local parnode = node.Parent
+				while parnode and (not searchResults[parnode] or expandTable[parnode] == 0) do
+					expandTable[parnode] = true
+					searchResults[parnode] = true
+					parnode = parnode.Parent
+				end
+				expandedpar = true
+			end
+		end
+		
+		if #node > 0 then search(node) end
+	end
+end
+return search]==]
+
+		local funcStr = template:format(finalHeaders,finalSetups,finalObjectDefs,finalPredicate)
+		local s,func = pcall(loadstring,funcStr)
+		if not s or not func then return nil,specFilterList end
+
+		local env = setmetatable({["searchResults"] = searchResults, ["nodes"] = nodes, ["Explorer"] = Explorer, ["specResults"] = specResults,
+			["service"] = service},{__index = getfenv()})
+		setfenv(func,env)
+
+		return func(),specFilterList
+	end
+
+	Explorer.DoSearch = function(query)
+		table.clear(Explorer.SearchExpanded)
+		table.clear(searchResults)
+		expanded = (#query == 0 and Explorer.Expanded or Explorer.SearchExpanded)
+		searchFunc = nil
+
+		if #query > 0 then	
+			local expandTable = Explorer.SearchExpanded
+			local specFilters
+
+			local lower = string.lower
+			local find = string.find
+			local tostring = tostring
+
+			local lowerQuery = lower(query)
+
+			local function defaultSearch(root)
+				local expandedpar = false
+				for i = 1,#root do
+					local node = root[i]
+					local obj = node.Obj
+
+					if find(lower(tostring(obj)),lowerQuery,1,true) then
+						expandTable[node] = 0
+						searchResults[node] = true
+						if not expandedpar then
+							local parnode = node.Parent
+							while parnode and (not searchResults[parnode] or expandTable[parnode] == 0) do
+								expanded[parnode] = true
+								searchResults[parnode] = true
+								parnode = parnode.Parent
+							end
+							expandedpar = true
+						end
+					end
+
+					if #node > 0 then defaultSearch(node) end
+				end
+			end
+
+			if Main.Elevated then
+				local start = tick()
+				searchFunc,specFilters = Explorer.BuildSearchFunc(query)
+				--print("BUILD SEARCH",tick()-start)
+			else
+				searchFunc = defaultSearch
+			end
+
+			if specFilters then
+				table.clear(specResults)
+				for i = 1,#specFilters do -- Specific search filers that returns list of matches
+					local resMap = {}
+					specResults[i] = resMap
+					local objs = specFilters[i]()
+					for c = 1,#objs do
+						local node = nodes[objs[c]]
+						if node then
+							resMap[node] = true
+						end
+					end
+				end
+			end
+
+			if searchFunc then
+				local start = tick()
+				searchFunc(nodes[game])
+				searchFunc(nilNode)
+				--warn(tick()-start)
+			end
+		end
+
+		Explorer.ForceUpdate()
+	end
+
+	Explorer.ClearSearch = function()
+		Explorer.GuiElems.SearchBar.Text = ""
+		expanded = Explorer.Expanded
+		searchFunc = nil
+	end
+
+	Explorer.InitSearch = function()
+		local searchBox = Explorer.GuiElems.ToolBar.SearchFrame.SearchBox
+		Explorer.GuiElems.SearchBar = searchBox
+
+		Lib.ViewportTextBox.convert(searchBox)
+
+		searchBox.FocusLost:Connect(function()
+			Explorer.DoSearch(searchBox.Text)
+		end)
+	end
+
+	Explorer.InitEntryTemplate = function()
+		entryTemplate = create({
+			{1,"TextButton",{AutoButtonColor=false,BackgroundColor3=Color3.new(0,0,0),BackgroundTransparency=1,BorderColor3=Color3.new(0,0,0),Font=3,Name="Entry",Position=UDim2.new(0,1,0,1),Size=UDim2.new(0,250,0,20),Text="",TextSize=14,}},
+			{2,"Frame",{BackgroundColor3=Color3.new(0.04313725605607,0.35294118523598,0.68627452850342),BackgroundTransparency=1,BorderColor3=Color3.new(0.33725491166115,0.49019610881805,0.73725491762161),BorderSizePixel=0,Name="Indent",Parent={1},Position=UDim2.new(0,20,0,0),Size=UDim2.new(1,-20,1,0),}},
+			{3,"TextLabel",{BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,Font=3,Name="EntryName",Parent={2},Position=UDim2.new(0,26,0,0),Size=UDim2.new(1,-26,1,0),Text="Workspace",TextColor3=Color3.new(0.86274516582489,0.86274516582489,0.86274516582489),TextSize=14,TextXAlignment=0,}},
+			{4,"TextButton",{BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,ClipsDescendants=true,Font=3,Name="Expand",Parent={2},Position=UDim2.new(0,-20,0,0),Size=UDim2.new(0,20,0,20),Text="",TextSize=14,}},
+			{5,"ImageLabel",{BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,Image="rbxassetid://5642383285",ImageRectOffset=Vector2.new(144,16),ImageRectSize=Vector2.new(16,16),Name="Icon",Parent={4},Position=UDim2.new(0,2,0,2),ScaleType=4,Size=UDim2.new(0,16,0,16),}},
+			{6,"ImageLabel",{BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,ImageRectOffset=Vector2.new(304,0),ImageRectSize=Vector2.new(16,16),Name="Icon",Parent={2},Position=UDim2.new(0,4,0,2),ScaleType=4,Size=UDim2.new(0,16,0,16),}},
+		})
+
+		local sys = Lib.ClickSystem.new()
+		sys.AllowedButtons = {1,2}
+		sys.OnDown:Connect(function(item,combo,button)
+			local ind = table.find(listEntries,item)
+			if not ind then return end
+			local node = tree[ind + Explorer.Index]
+			if not node then return end
+
+			local entry = listEntries[ind]
+
+			if button == 1 then
+				if combo == 2 then
+					if node.Obj:IsA("LuaSourceContainer") then
+						ScriptViewer.ViewScript(node.Obj)
+					elseif #node > 0 and expanded[node] ~= 0 then
+						expanded[node] = not expanded[node]
+						Explorer.Update()
+					end
+				end
+
+				if Properties.SelectObject(node.Obj) then
+					sys.IsRenaming = false
+					return
+				end
+
+				sys.IsRenaming = selection.Map[node]
+
+				if Lib.IsShiftDown() then
+					if not selection.Piviot then return end
+
+					local fromIndex = table.find(tree,selection.Piviot)
+					local toIndex = table.find(tree,node)
+					if not fromIndex or not toIndex then return end
+					fromIndex,toIndex = math.min(fromIndex,toIndex),math.max(fromIndex,toIndex)
+
+					local sList = selection.List
+					for i = #sList,1,-1 do
+						local elem = sList[i]
+						if selection.ShiftSet[elem] then
+							selection.Map[elem] = nil
+							table.remove(sList,i)
+						end
+					end
+					selection.ShiftSet = {}
+					for i = fromIndex,toIndex do
+						local elem = tree[i]
+						if not selection.Map[elem] then
+							selection.ShiftSet[elem] = true
+							selection.Map[elem] = true
+							sList[#sList+1] = elem
+						end
+					end
+					selection.Changed:Fire()
+				elseif Lib.IsCtrlDown() then
+					selection.ShiftSet = {}
+					if selection.Map[node] then selection:Remove(node) else selection:Add(node) end
+					selection.Piviot = node
+					sys.IsRenaming = false
+				elseif not selection.Map[node] then
+					selection.ShiftSet = {}
+					selection:Set(node)
+					selection.Piviot = node
+				end
+			elseif button == 2 then
+				if Properties.SelectObject(node.Obj) then
+					return
+				end
+
+				if not Lib.IsCtrlDown() and not selection.Map[node] then
+					selection.ShiftSet = {}
+					selection:Set(node)
+					selection.Piviot = node
+					Explorer.Refresh()
+				end
+			end
+
+			Explorer.Refresh()
+		end)
+
+		sys.OnRelease:Connect(function(item,combo,button,position)
+			local ind = table.find(listEntries,item)
+			if not ind then return end
+			local node = tree[ind + Explorer.Index]
+			if not node then return end
+
+			if button == 1 then
+				if selection.Map[node] and not Lib.IsShiftDown() and not Lib.IsCtrlDown() then
+					selection.ShiftSet = {}
+					selection:Set(node)
+					selection.Piviot = node
+					Explorer.Refresh()
+				end
+
+				local id = sys.ClickId
+				Lib.FastWait(sys.ComboTime)
+				if combo == 1 and id == sys.ClickId and sys.IsRenaming and selection.Map[node] then
+					Explorer.SetRenamingNode(node)
+				end
+			elseif button == 2 then
+				Explorer.ShowRightClick(position)
+			end
+		end)
+		Explorer.ClickSystem = sys
+	end
+
+	Explorer.InitDelCleaner = function()
+		coroutine.wrap(function()
+			local fw = Lib.FastWait
+			while true do
+				local processed = false
+				local c = 0
+				for _,node in next,nodes do
+					if node.HasDel then
+						local delInd
+						for i = 1,#node do
+							if node[i].Del then
+								delInd = i
+								break
+							end
+						end
+						if delInd then
+							for i = delInd+1,#node do
+								local cn = node[i]
+								if not cn.Del then
+									node[delInd] = cn
+									delInd = delInd+1
+								end
+							end
+							for i = delInd,#node do
+								node[i] = nil
+							end
+						end
+						node.HasDel = false
+						processed = true
+						fw()
+					end
+					c = c + 1
+					if c > 10000 then
+						c = 0
+						fw()
+					end
+				end
+				if processed and not refreshDebounce then Explorer.PerformRefresh() end
+				fw(0.5)
+			end
+		end)()
+	end
+
+	Explorer.UpdateSelectionVisuals = function()
+		local holder = Explorer.SelectionVisualsHolder
+		local isa = game.IsA
+		local clone = game.Clone
+		if not holder then
+			holder = Instance.new("ScreenGui")
+			holder.Name = "ExplorerSelections"
+			holder.DisplayOrder = Main.DisplayOrders.Core
+			Lib.ShowGui(holder)
+			Explorer.SelectionVisualsHolder = holder
+			Explorer.SelectionVisualCons = {}
+
+			local guiTemplate = create({
+				{1,"Frame",{BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,Size=UDim2.new(0,100,0,100),}},
+				{2,"Frame",{BackgroundColor3=Color3.new(0.04313725605607,0.35294118523598,0.68627452850342),BorderSizePixel=0,Parent={1},Position=UDim2.new(0,-1,0,-1),Size=UDim2.new(1,2,0,1),}},
+				{3,"Frame",{BackgroundColor3=Color3.new(0.04313725605607,0.35294118523598,0.68627452850342),BorderSizePixel=0,Parent={1},Position=UDim2.new(0,-1,1,0),Size=UDim2.new(1,2,0,1),}},
+				{4,"Frame",{BackgroundColor3=Color3.new(0.04313725605607,0.35294118523598,0.68627452850342),BorderSizePixel=0,Parent={1},Position=UDim2.new(0,-1,0,0),Size=UDim2.new(0,1,1,0),}},
+				{5,"Frame",{BackgroundColor3=Color3.new(0.04313725605607,0.35294118523598,0.68627452850342),BorderSizePixel=0,Parent={1},Position=UDim2.new(1,0,0,0),Size=UDim2.new(0,1,1,0),}},
+			})
+			Explorer.SelectionVisualGui = guiTemplate
+
+			local boxTemplate = Instance.new("SelectionBox")
+			boxTemplate.LineThickness = 0.03
+			boxTemplate.Color3 = Color3.fromRGB(0, 170, 255)
+			Explorer.SelectionVisualBox = boxTemplate
+		end
+		holder:ClearAllChildren()
+
+		-- Updates theme
+		for i,v in pairs(Explorer.SelectionVisualGui:GetChildren()) do
+			v.BackgroundColor3 = Color3.fromRGB(0, 170, 255)
+		end
+
+		local attachCons = Explorer.SelectionVisualCons
+		for i = 1,#attachCons do
+			attachCons[i].Destroy()
+		end
+		table.clear(attachCons)
+
+		local partEnabled = Settings.Explorer.PartSelectionBox
+		local guiEnabled = Settings.Explorer.GuiSelectionBox
+		if not partEnabled and not guiEnabled then return end
+
+		local svg = Explorer.SelectionVisualGui
+		local svb = Explorer.SelectionVisualBox
+		local attachTo = Lib.AttachTo
+		local sList = selection.List
+		local count = 1
+		local boxCount = 0
+		local workspaceNode = nodes[workspace]
+		for i = 1,#sList do
+			if boxCount > 1000 then break end
+			local node = sList[i]
+			local obj = node.Obj
+
+			if node ~= workspaceNode then
+				if isa(obj,"GuiObject") and guiEnabled then
+					local newVisual = clone(svg)
+					attachCons[count] = attachTo(newVisual,{Target = obj, Resize = true})
+					count = count + 1
+					newVisual.Parent = holder
+					boxCount = boxCount + 1
+				elseif isa(obj,"PVInstance") and partEnabled then
+					local newBox = clone(svb)
+					newBox.Adornee = obj
+					newBox.Parent = holder
+					boxCount = boxCount + 1
+				end
+			end
+		end
+	end
+
+	Explorer.Init = function()
+		Explorer.LegacyClassIcons = Lib.IconMap.newLinear("rbxasset://textures/ClassImages.PNG", 16,16)
+		if Settings.ClassIcon ~= nil and Settings.ClassIcon ~= "Old" then
+			iconData = Lib.IconMap.getIconDataFromName(Settings.ClassIcon)
+			
+			Explorer.ClassIcons = Lib.IconMap.new("rbxassetid://"..tostring(iconData.MapId), iconData.IconSize * iconData.Witdh, iconData.IconSize * iconData.Height,iconData.IconSize,iconData.IconSize)
+			-- move every value dict 1 behind because SetDict starts at 0 not 1 lol
+			local fixed = {}
+			for i,v in pairs(iconData.Icons) do
+				fixed[i] = v - 1
+			end
+			
+			iconData.Icons = fixed
+			Explorer.ClassIcons:SetDict(fixed)
+		else
+			Explorer.ClassIcons = Lib.IconMap.newLinear("rbxasset://textures/ClassImages.PNG", 16,16)
+		end
+		
+		Explorer.MiscIcons = Main.MiscIcons
+
+		clipboard = {}
+
+		selection = Lib.Set.new()
+		selection.ShiftSet = {}
+		selection.Changed:Connect(Properties.ShowExplorerProps)
+		Explorer.Selection = selection
+
+		-- AutoDodge helper panel: mirrors Dex++'s current selection only; it does not scan the game.
+		local dodgeInfoGui = Instance.new("ScreenGui")
+		dodgeInfoGui.Name = "DexSelectionInfoPanel"
+		dodgeInfoGui.ResetOnSpawn = false
+		dodgeInfoGui.DisplayOrder = 999
+		local dodgePanel = Instance.new("Frame")
+		dodgePanel.Name = "Panel"
+		dodgePanel.Size = UDim2.new(0, 370, 0, 300)
+		dodgePanel.Position = UDim2.new(0, 24, 0.35, 0)
+		dodgePanel.BackgroundColor3 = Color3.fromRGB(30, 30, 34)
+		dodgePanel.BorderSizePixel = 0
+		dodgePanel.Parent = dodgeInfoGui
+		local panelCorner = Instance.new("UICorner")
+		panelCorner.CornerRadius = UDim.new(0, 7)
+		panelCorner.Parent = dodgePanel
+		local panelStroke = Instance.new("UIStroke")
+		panelStroke.Color = Color3.fromRGB(75, 75, 85)
+		panelStroke.Thickness = 1
+		panelStroke.Parent = dodgePanel
+
+		local panelTitle = Instance.new("TextLabel")
+		panelTitle.Name = "Title"
+		panelTitle.Size = UDim2.new(1, -42, 0, 32)
+		panelTitle.Position = UDim2.new(0, 10, 0, 0)
+		panelTitle.BackgroundTransparency = 1
+		panelTitle.Font = Enum.Font.SourceSansBold
+		panelTitle.TextSize = 17
+		panelTitle.TextXAlignment = Enum.TextXAlignment.Left
+		panelTitle.TextColor3 = Color3.fromRGB(245, 245, 245)
+		panelTitle.Text = "Dex++ — выбранные объекты"
+		panelTitle.Parent = dodgePanel
+
+		local closeButton = Instance.new("TextButton")
+		closeButton.Name = "Close"
+		closeButton.Size = UDim2.new(0, 28, 0, 26)
+		closeButton.Position = UDim2.new(1, -32, 0, 3)
+		closeButton.BackgroundColor3 = Color3.fromRGB(60, 60, 66)
+		closeButton.BorderSizePixel = 0
+		closeButton.Font = Enum.Font.SourceSansBold
+		closeButton.TextSize = 18
+		closeButton.TextColor3 = Color3.new(1, 1, 1)
+		closeButton.Text = "×"
+		closeButton.Parent = dodgePanel
+		Instance.new("UICorner", closeButton).CornerRadius = UDim.new(0, 5)
+		closeButton.MouseButton1Click:Connect(function() dodgeInfoGui.Enabled = false end)
+
+		local selectionCount = Instance.new("TextLabel")
+		selectionCount.Name = "Count"
+		selectionCount.Size = UDim2.new(1, -20, 0, 20)
+		selectionCount.Position = UDim2.new(0, 10, 0, 34)
+		selectionCount.BackgroundTransparency = 1
+		selectionCount.Font = Enum.Font.SourceSans
+		selectionCount.TextSize = 14
+		selectionCount.TextXAlignment = Enum.TextXAlignment.Left
+		selectionCount.TextColor3 = Color3.fromRGB(180, 190, 205)
+		selectionCount.Text = "Выбрано: 0"
+		selectionCount.Parent = dodgePanel
+
+		local selectionText = Instance.new("TextBox")
+		selectionText.Name = "ObjectInfo"
+		selectionText.Size = UDim2.new(1, -20, 1, -100)
+		selectionText.Position = UDim2.new(0, 10, 0, 57)
+		selectionText.BackgroundColor3 = Color3.fromRGB(22, 22, 25)
+		selectionText.BorderSizePixel = 0
+		selectionText.ClearTextOnFocus = false
+		selectionText.MultiLine = true
+		selectionText.TextEditable = true
+		selectionText.TextXAlignment = Enum.TextXAlignment.Left
+		selectionText.TextYAlignment = Enum.TextYAlignment.Top
+		selectionText.Font = Enum.Font.Code
+		selectionText.TextSize = 13
+		selectionText.TextColor3 = Color3.fromRGB(225, 230, 238)
+		selectionText.TextWrapped = false
+		selectionText.Text = "Выбери объект(ы) в Explorer Dex++ — здесь появятся их имена, классы и пути."
+		selectionText.Parent = dodgePanel
+		Instance.new("UICorner", selectionText).CornerRadius = UDim.new(0, 5)
+		local textPadding = Instance.new("UIPadding")
+		textPadding.PaddingTop = UDim.new(0, 6)
+		textPadding.PaddingLeft = UDim.new(0, 7)
+		textPadding.PaddingRight = UDim.new(0, 7)
+		textPadding.Parent = selectionText
+
+		local copyButton = Instance.new("TextButton")
+		copyButton.Name = "CopyAll"
+		copyButton.Size = UDim2.new(1, -20, 0, 32)
+		copyButton.Position = UDim2.new(0, 10, 1, -38)
+		copyButton.BackgroundColor3 = Color3.fromRGB(30, 105, 175)
+		copyButton.BorderSizePixel = 0
+		copyButton.Font = Enum.Font.SourceSansBold
+		copyButton.TextSize = 15
+		copyButton.TextColor3 = Color3.new(1, 1, 1)
+		copyButton.Text = "Скопировать всё"
+		copyButton.Parent = dodgePanel
+		Instance.new("UICorner", copyButton).CornerRadius = UDim.new(0, 5)
+
+		local function getSelectionInfo()
+			local lines = {}
+			local selected = selection.List
+			for i = 1, #selected do
+				local node = selected[i]
+				local obj = node and node.Obj
+				if obj then
+					local ok, path = pcall(Explorer.GetInstancePath, obj)
+					lines[#lines + 1] = string.format("[%d] %s\nClass: %s\nPath: %s", i, tostring(obj.Name), tostring(obj.ClassName), ok and tostring(path) or "<путь недоступен>")
+				end
+			end
+			return lines
+		end
+
+		local function refreshSelectionPanel()
+			local lines = getSelectionInfo()
+			selectionCount.Text = "Выбрано: " .. tostring(#selection.List)
+			if #lines == 0 then
+				selectionText.Text = "Нет выбранных объектов.\n\nВыбери объект(ы) в Explorer Dex++ — панель автоматически обновится."
+			else
+				selectionText.Text = table.concat(lines, "\n\n")
+			end
+		end
+		selection.Changed:Connect(refreshSelectionPanel)
+		copyButton.MouseButton1Click:Connect(function()
+			refreshSelectionPanel()
+			local textToCopy = selectionText.Text
+			if #selection.List == 0 then
+				copyButton.Text = "Сначала выбери объекты"
+				task.delay(1.5, function() if copyButton.Parent then copyButton.Text = "Скопировать всё" end end)
+				return
+			end
+			local setter = env.setclipboard or setclipboard
+			if type(setter) == "function" then
+				local ok = pcall(setter, textToCopy)
+				copyButton.Text = ok and "Скопировано!" or "Выдели текст вручную"
+			else
+				selectionText:CaptureFocus()
+				selectionText.CursorPosition = #selectionText.Text + 1
+				copyButton.Text = "Выдели текст вручную"
+			end
+			task.delay(1.5, function() if copyButton.Parent then copyButton.Text = "Скопировать всё" end end)
+		end)
+
+		-- Drag the panel by its title bar.
+		local dragging, dragStart, panelStart = false, nil, nil
+		panelTitle.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				dragging = true
+				dragStart = input.Position
+				panelStart = dodgePanel.Position
+				input.Changed:Connect(function()
+					if input.UserInputState == Enum.UserInputState.End then dragging = false end
+				end)
+			end
+		end)
+		service.UserInputService.InputChanged:Connect(function(input)
+			if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+				local delta = input.Position - dragStart
+				dodgePanel.Position = UDim2.new(panelStart.X.Scale, panelStart.X.Offset + delta.X, panelStart.Y.Scale, panelStart.Y.Offset + delta.Y)
+			end
+		end)
+		Main.SecureGui(dodgeInfoGui)
+		refreshSelectionPanel()
+
+		Explorer.InitRightClick()
+		Explorer.InitInsertObject()
+		Explorer.SetSortingEnabled(Settings.Explorer.Sorting)
+		Explorer.Expanded = setmetatable({},{__mode = "k"})
+		Explorer.SearchExpanded = setmetatable({},{__mode = "k"})
+		expanded = Explorer.Expanded
+
+		nilNode.Obj.Name = "Nil Instances"
+		nilNode.Locked = true
+
+		local explorerItems = create({
+			{1,"Folder",{Name="ExplorerItems",}},
+			{2,"Frame",{BackgroundColor3=Color3.new(0.20392157137394,0.20392157137394,0.20392157137394),BorderSizePixel=0,Name="ToolBar",Parent={1},Size=UDim2.new(1,0,0,22),}},
+			{3,"Frame",{BackgroundColor3=Color3.new(0.14901961386204,0.14901961386204,0.14901961386204),BorderColor3=Color3.new(0.1176470592618,0.1176470592618,0.1176470592618),BorderSizePixel=0,Name="SearchFrame",Parent={2},Position=UDim2.new(0,3,0,1),Size=UDim2.new(1,-6,0,18),}},
+			{4,"TextBox",{BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,ClearTextOnFocus=false,Font=3,Name="SearchBox",Parent={3},PlaceholderColor3=Color3.new(0.39215689897537,0.39215689897537,0.39215689897537),PlaceholderText="Search workspace",Position=UDim2.new(0,4,0,0),Size=UDim2.new(1,-24,0,18),Text="",TextColor3=Color3.new(1,1,1),TextSize=14,TextXAlignment=0,}},
+			{5,"UICorner",{CornerRadius=UDim.new(0,2),Parent={3},}},
+			{6,"UIStroke",{Thickness=1.4,Parent={3},Color=Color3.fromRGB(42,42,42)}},
+			{7,"TextButton",{AutoButtonColor=false,BackgroundColor3=Color3.new(0.12549020349979,0.12549020349979,0.12549020349979),BackgroundTransparency=1,BorderSizePixel=0,Font=3,Name="Reset",Parent={3},Position=UDim2.new(1,-17,0,1),Size=UDim2.new(0,16,0,16),Text="",TextColor3=Color3.new(1,1,1),TextSize=14,}},
+			{8,"ImageLabel",{BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,Image="rbxassetid://5034718129",ImageColor3=Color3.new(0.39215686917305,0.39215686917305,0.39215686917305),Parent={7},Size=UDim2.new(0,16,0,16),}},
+			{9,"TextButton",{AutoButtonColor=false,BackgroundColor3=Color3.new(0.12549020349979,0.12549020349979,0.12549020349979),BackgroundTransparency=1,BorderSizePixel=0,Font=3,Name="Refresh",Parent={2},Position=UDim2.new(1,-20,0,1),Size=UDim2.new(0,18,0,18),Text="",TextColor3=Color3.new(1,1,1),TextSize=14,Visible=false,}},
+			{10,"ImageLabel",{BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,Image="rbxassetid://5642310344",Parent={9},Position=UDim2.new(0,3,0,3),Size=UDim2.new(0,12,0,12),}},
+			{11,"Frame",{BackgroundColor3=Color3.new(0.15686275064945,0.15686275064945,0.15686275064945),BorderSizePixel=0,Name="ScrollCorner",Parent={1},Position=UDim2.new(1,-16,1,-16),Size=UDim2.new(0,16,0,16),Visible=false,}},
+			{12,"Frame",{BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,ClipsDescendants=true,Name="List",Parent={1},Position=UDim2.new(0,0,0,23),Size=UDim2.new(1,0,1,-23),}}
+		})
+
+		toolBar = explorerItems.ToolBar
+		treeFrame = explorerItems.List
+
+		Explorer.GuiElems.ToolBar = toolBar
+		Explorer.GuiElems.TreeFrame = treeFrame
+
+		scrollV = Lib.ScrollBar.new()		
+		scrollV.WheelIncrement = 3
+		scrollV.Gui.Position = UDim2.new(1,-16,0,23)
+		scrollV:SetScrollFrame(treeFrame)
+		scrollV.Scrolled:Connect(function()
+			Explorer.Index = scrollV.Index
+			Explorer.Refresh()
+		end)
+
+		scrollH = Lib.ScrollBar.new(true)
+		scrollH.Increment = 5
+		scrollH.WheelIncrement = Explorer.EntryIndent
+		scrollH.Gui.Position = UDim2.new(0,0,1,-16)
+		scrollH.Scrolled:Connect(function()
+			Explorer.Refresh()
+		end)
+
+		local window = Lib.Window.new()
+		Explorer.Window = window
+		window:SetTitle("Explorer")
+		window.GuiElems.Line.Position = UDim2.new(0,0,0,22)
+
+		Explorer.InitEntryTemplate()
+		toolBar.Parent = window.GuiElems.Content
+		treeFrame.Parent = window.GuiElems.Content
+		explorerItems.ScrollCorner.Parent = window.GuiElems.Content
+		scrollV.Gui.Parent = window.GuiElems.Content
+		scrollH.Gui.Parent = window.GuiElems.Content
+
+		-- Init stuff that requires the window
+		Explorer.InitRenameBox()
+		Explorer.InitSearch()
+		Explorer.InitDelCleaner()
+		selection.Changed:Connect(Explorer.UpdateSelectionVisuals)
+
+		-- Window events
+		window.GuiElems.Main:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+			if Explorer.Active then
+				Explorer.UpdateView()
+				Explorer.Refresh()
+			end
+		end)
+		window.OnActivate:Connect(function()
+			Explorer.Active = true
+			Explorer.UpdateView()
+			Explorer.Update()
+			Explorer.Refresh()
+		end)
+		window.OnRestore:Connect(function()
+			Explorer.Active = true
+			Explorer.UpdateView()
+			Explorer.Update()
+			Explorer.Refresh()
+		end)
+		window.OnDeactivate:Connect(function() Explorer.Active = false end)
+		window.OnMinimize:Connect(function() Explorer.Active = false end)
+
+		-- Settings
+		autoUpdateSearch = Settings.Explorer.AutoUpdateSearch
+
+		-- Fill in nodes
+		nodes[game] = {Obj = game}
+		expanded[nodes[game]] = true
+
+		-- Nil Instances
+		if env.getnilinstances then
+			nodes[nilNode.Obj] = nilNode
+		end
+
+		Explorer.SetupConnections()
+
+		local insts = getDescendants(game)
+		if Main.Elevated then
+			for i = 1,#insts do
+				local obj = insts[i]
+				local par = nodes[ffa(obj,"Instance")]
+				if not par then continue end
+				local newNode = {
+					Obj = obj,
+					Parent = par,
+				}
+				nodes[obj] = newNode
+				par[#par+1] = newNode
+			end
+		else
+			for i = 1,#insts do
+				local obj = insts[i]
+				local s,parObj = pcall(ffa,obj,"Instance")
+				local par = nodes[parObj]
+				if not par then continue end
+				local newNode = {
+					Obj = obj,
+					Parent = par,
+				}
+				nodes[obj] = newNode
+				par[#par+1] = newNode
+			end
+		end
+	end
+
+	return Explorer
+end
+
+return {InitDeps = initDeps, InitAfterMain = initAfterMain, Main = main}
+end,
+["Lib"] = function()
+--[[
+	Lib Module
+	
+	Container for functions and classes
+]]
+
+-- Common Locals
+local Main,Lib,Apps,Settings -- Main Containers
+local Explorer, Properties, ScriptViewer, Notebook -- Major Apps
+local API,RMD,env,service,plr,create,createSimple -- Main Locals
+
+local function initDeps(data)
+	Main = data.Main
+	Lib = data.Lib
+	Apps = data.Apps
+	Settings = data.Settings
+
+	API = data.API
+	RMD = data.RMD
+	env = data.env
+	service = data.service
+	plr = data.plr
+	create = data.create
+	createSimple = data.createSimple
+end
+
+local function initAfterMain()
+	Explorer = Apps.Explorer
+	Properties = Apps.Properties
+	ScriptViewer = Apps.ScriptViewer
+	Notebook = Apps.Notebook
+end
+
+local function main()
+	local Lib = {}
+
+	local renderStepped = service.RunService.RenderStepped
+	local signalWait = renderStepped.wait
+	local PH = newproxy() -- Placeholder, must be replaced in constructor
+	local SIGNAL = newproxy()
+
+	-- Usually for classes that work with a Roblox Object
+	local function initObj(props,mt)
+		local type = type
+		local function copy(t)
+			local res = {}
+			for i,v in pairs(t) do
+				if v == SIGNAL then
+					res[i] = Lib.Signal.new()
+				elseif type(v) == "table" then
+					res[i] = copy(v)
+				else
+					res[i] = v
+				end
+			end		
+			return res
+		end
+
+		local newObj = copy(props)
+		return setmetatable(newObj,mt)
+	end
+
+	local function getGuiMT(props,funcs)
+		return {__index = function(self,ind) if not props[ind] then return funcs[ind] or self.Gui[ind] end end,
+		__newindex = function(self,ind,val) if not props[ind] then self.Gui[ind] = val else rawset(self,ind,val) end end}
+	end
+
+	-- Functions
+
+	Lib.FormatLuaString = (function()
+		local string = string
+		local gsub = string.gsub
+		local format = string.format
+		local char = string.char
+		local cleanTable = {['"'] = '\\"', ['\\'] = '\\\\'}
+		for i = 0,31 do
+			cleanTable[char(i)] = "\\"..format("%03d",i)
+		end
+		for i = 127,255 do
+			cleanTable[char(i)] = "\\"..format("%03d",i)
+		end
+
+		return function(str)
+			return gsub(str,"[\"\\\0-\31\127-\255]",cleanTable)
+		end
+	end)()
+
+	Lib.CheckMouseInGui = function(gui)
+		if gui == nil then return false end
+		local mouse = Main.Mouse
+		local guiPosition = gui.AbsolutePosition
+		local guiSize = gui.AbsoluteSize	
+
+		return mouse.X >= guiPosition.X and mouse.X < guiPosition.X + guiSize.X and mouse.Y >= guiPosition.Y and mouse.Y < guiPosition.Y + guiSize.Y
+	end
+
+	Lib.IsShiftDown = function()
+		return service.UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) or service.UserInputService:IsKeyDown(Enum.KeyCode.RightShift)
+	end
+
+	Lib.IsCtrlDown = function()
+		return service.UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) or service.UserInputService:IsKeyDown(Enum.KeyCode.RightControl)
+	end
+
+	Lib.CreateArrow = function(size,num,dir)
+		local max = num
+		local arrowFrame = createSimple("Frame",{
+			BackgroundTransparency = 1,
+			Name = "Arrow",
+			Size = UDim2.new(0,size,0,size)
+		})
+		if dir == "up" then
+			for i = 1,num do
+				local newLine = createSimple("Frame",{
+					BackgroundColor3 = Color3.new(220/255,220/255,220/255),
+					BorderSizePixel = 0,
+					Position = UDim2.new(0,math.floor(size/2)-(i-1),0,math.floor(size/2)+i-math.floor(max/2)-1),
+					Size = UDim2.new(0,i+(i-1),0,1),
+					Parent = arrowFrame
+				})
+			end
+			return arrowFrame
+		elseif dir == "down" then
+			for i = 1,num do
+				local newLine = createSimple("Frame",{
+					BackgroundColor3 = Color3.new(220/255,220/255,220/255),
+					BorderSizePixel = 0,
+					Position = UDim2.new(0,math.floor(size/2)-(i-1),0,math.floor(size/2)-i+math.floor(max/2)+1),
+					Size = UDim2.new(0,i+(i-1),0,1),
+					Parent = arrowFrame
+				})
+			end
+			return arrowFrame
+		elseif dir == "left" then
+			for i = 1,num do
+				local newLine = createSimple("Frame",{
+					BackgroundColor3 = Color3.new(220/255,220/255,220/255),
+					BorderSizePixel = 0,
+					Position = UDim2.new(0,math.floor(size/2)+i-math.floor(max/2)-1,0,math.floor(size/2)-(i-1)),
+					Size = UDim2.new(0,1,0,i+(i-1)),
+					Parent = arrowFrame
+				})
+			end
+			return arrowFrame
+		elseif dir == "right" then
+			for i = 1,num do
+				local newLine = createSimple("Frame",{
+					BackgroundColor3 = Color3.new(220/255,220/255,220/255),
+					BorderSizePixel = 0,
+					Position = UDim2.new(0,math.floor(size/2)-i+math.floor(max/2)+1,0,math.floor(size/2)-(i-1)),
+					Size = UDim2.new(0,1,0,i+(i-1)),
+					Parent = arrowFrame
+				})
+			end
+			return arrowFrame
+		end
+		error("r u ok")
+	end
+
+	Lib.ParseXML = (function()
+		local func = function()
+			-- Only exists to parse RMD
+			-- from https://github.com/jonathanpoelen/xmlparser
+
+			local string, print, pairs = string, print, pairs
+
+			-- http://lua-users.org/wiki/StringTrim
+			local trim = function(s)
+				local from = s:match"^%s*()"
+				return from > #s and "" or s:match(".*%S", from)
+			end
+
+			local gtchar = string.byte('>', 1)
+			local slashchar = string.byte('/', 1)
+			local D = string.byte('D', 1)
+			local E = string.byte('E', 1)
+
+			function parse(s, evalEntities)
+				-- remove comments
+				s = s:gsub('<!%-%-(.-)%-%->', '')
+
+				local entities, tentities = {}
+
+				if evalEntities then
+					local pos = s:find('<[_%w]')
+					if pos then
+						s:sub(1, pos):gsub('<!ENTITY%s+([_%w]+)%s+(.)(.-)%2', function(name, q, entity)
+							entities[#entities+1] = {name=name, value=entity}
+						end)
+						tentities = createEntityTable(entities)
+						s = replaceEntities(s:sub(pos), tentities)
+					end
+				end
+
+				local t, l = {}, {}
+
+				local addtext = function(txt)
+					txt = txt:match'^%s*(.*%S)' or ''
+					if #txt ~= 0 then
+						t[#t+1] = {text=txt}
+					end		
+				end
+
+				s:gsub('<([?!/]?)([-:_%w]+)%s*(/?>?)([^<]*)', function(type, name, closed, txt)
+					-- open
+					if #type == 0 then
+						local a = {}
+						if #closed == 0 then
+							local len = 0
+							for all,aname,_,value,starttxt in string.gmatch(txt, "(.-([-_%w]+)%s*=%s*(.)(.-)%3%s*(/?>?))") do
+								len = len + #all
+								a[aname] = value
+								if #starttxt ~= 0 then
+									txt = txt:sub(len+1)
+									closed = starttxt
+									break
 								end
 							end
 						end
-					end
-					local look=unit(flat(root.CFrame.LookVector))
-					local toMe=flat(myPos-root.Position)
-					local facing=0
-					if look.Magnitude>0.1 and toMe.Magnitude>0.1 then facing=look:Dot(unit(toMe)) end
-					local vel=root.AssemblyLinearVelocity
-					local approach=0
-					if toMe.Magnitude>0.1 then approach=math.clamp((-vel):Dot(unit(toMe))/24,0,1) end
-					local reach=4.5*charScale
-					local tool=model:FindFirstChildOfClass("Tool")
-					if tool then
-						local h=tool:FindFirstChild("Handle")
-						if h and h:IsA("BasePart") then reach=math.max(reach,(h.Position-root.Position).Magnitude+2) end
-						if containsToken(tool.Name,CFG.GUN_TOOL_WORDS) then attackType="ranged"; reach=math.max(reach,40) end
-					end
-					local intent=clamp01(0.25+facing*0.45+approach*0.35+attackConf*0.4)
-					local existence=attackConf>0.4 and 0.85 or (facing>0.3 and d<reach*1.4 and 0.55 or 0.25)
-					if existence>=0.3 or attackConf>=0.3 then
-						local half=Vector3.new(reach*0.35,3*charScale,reach*0.55)
-						local cf=CFrame.lookAt(root.Position, root.Position+(look.Magnitude>0.1 and look or Vector3.new(0,0,-1)))
-						addThreat(list,{
-							kind="box",cf=cf,half=half,vel=vel,accel=ZERO,
-							from=hitFrom or 0, to=hitTo or (d/28+0.25), dist=d,
-							urgent=attackConf>0.6 and facing>0.4 and d<reach*1.2,
-							existence=existence,intent=intent,
-							hitProb=clamp01(attackConf*0.7+facing*0.3), severity=attackType=="ranged" and 0.7 or 0.6,
-							uncertainty=0.8+(1-attackConf)*1.5,
-							source="actor",attackType=attackType,instance=root,owner=model,look=look,
-						})
-					end
-				end
-			end
-		end
-	end
-end
-local function detectParts(list,myPos,now,myVel)
-	if not CFG.DETECT_PARTS then return end
-	local R=CFG.DETECT_RADIUS
-	local function consider(part,baseExist)
-		if not part or not part.Parent then return end
-		if softIgnore(part, part:FindFirstAncestorOfClass("Model")) then return end
-		local pos=part.Position; local d=(pos-myPos).Magnitude
-		if d>R+8 then return end
-		local vel=part.AssemblyLinearVelocity; local speed=vel.Magnitude
-		local size=part.Size; local reach=math.max(size.X,size.Y,size.Z)*0.5
-		local approaching=0
-		if d>0.2 and speed>1 then approaching=math.clamp((-(vel):Dot(unit(myPos-pos)))/30,0,1) end
-		local existence=baseExist
-		if speed>20 then existence=math.max(existence,0.7) end
-		if approaching>0.5 then existence=math.max(existence,0.65) end
-		local isStatic=speed<1.5
-		addThreat(list,{
-			kind="ell",cf=part.CFrame,rf=reach+1,rs=reach+0.5,ry=math.max(size.Y*0.5,2),
-			vel=vel,accel=ZERO,from=0,to=isStatic and FAR or (d/math.max(speed,4)+0.4),dist=d,
-			urgent=not isStatic and approaching>0.6 and d<18,
-			existence=existence,intent=isStatic and 0.4 or clamp01(0.3+approaching*0.6),
-			hitProb=clamp01(0.4+approaching*0.4),severity=0.55,
-			uncertainty=isStatic and 0.4 or 1.2,
-			source="part",attackType=isStatic and "aoe" or "projectile",instance=part,owner=ownerOf(part),
-		})
-	end
-	for part in pairs(flaggedParts) do
-		if not part.Parent then flaggedParts[part]=nil else consider(part,0.75) end
-	end
-	local n=0
-	for part in pairs(dynamicParts) do
-		if n>40 then break end
-		if not part.Parent then dynamicParts[part]=nil
-		elseif (part.Position-myPos).Magnitude<CFG.NEAR_CACHE and part.AssemblyLinearVelocity.Magnitude>12 then
-			consider(part,0.4); n+=1
-		end
-	end
-end
-local function detectProjectiles(list,myPos,now,myVel)
-	if not CFG.DETECT_PROJECTILES then return end
-	local R,checked=CFG.DETECT_RADIUS,0
-	for part in pairs(dynamicParts) do
-		if checked>30 then break end
-		if part.Parent then
-			local vel=part.AssemblyLinearVelocity
-			if vel.Magnitude>=28 then
-				local d=(part.Position-myPos).Magnitude
-				if d<=R then
-					checked+=1
-					local eta,dist=closestApproach(part.Position,vel,myPos,myVel)
-					local size=math.max(part.Size.X,part.Size.Y,part.Size.Z)*0.5
-					local willHit=dist<(size+3*charScale) and eta<CFG.HORIZON
-					addThreat(list,{
-						kind="ell",cf=part.CFrame,rf=size+1.2,rs=size+0.8,ry=size+0.8,
-						vel=vel,accel=Vector3.new(0,-workspace.Gravity*0.15,0),
-						from=math.max(0,eta-0.05),to=eta+0.2,dist=d,
-						urgent=willHit and eta<CFG.PANIC_TIME*1.5,
-						existence=0.8,intent=willHit and 0.85 or 0.5,hitProb=willHit and 0.8 or 0.35,
-						severity=0.75,uncertainty=1.0+vel.Magnitude*0.01,velUnc=4,
-						source="projectile",attackType="projectile",instance=part,owner=ownerOf(part),
-					})
-					gameCaps.HAS_PROJECTILES=true
-				end
-			end
-		end
-	end
-end
-local function beamWidth(beam)
-	if beam:IsA("Beam") then
-		return math.max(1.0, (((tonumber(beam.Width0) or 1)+(tonumber(beam.Width1) or 1))*0.5))
-	end
-	if beam:IsA("Trail") then
-		local ok,scale=pcall(function()
-			local ws=beam.WidthScale
-			if ws and ws.Keypoints and #ws.Keypoints>0 then
-				local s=0 for _,kp in ipairs(ws.Keypoints) do s+=kp.Value end return s/#ws.Keypoints
-			end return 1
-		end)
-		return math.max(1.0,(ok and type(scale)=="number" and scale or 1)*1.4)
-	end
-	return 1.8
-end
-local function detectBeams(list,myPos,now)
-	if not CFG.DETECT_BEAMS then return end
-	for beam in pairs(beamThreats) do
-		if not beam.Parent then beamThreats[beam]=nil
-		else
-			local a0,a1=beam.Attachment0,beam.Attachment1
-			if a0 and a1 then
-				local p0,p1=a0.WorldPosition,a1.WorldPosition
-				local mid=(p0+p1)*0.5; local d=(mid-myPos).Magnitude
-				if d<=CFG.DETECT_RADIUS+25 then
-					local dir=p1-p0; local len=dir.Magnitude
-					if len>1 then
-						local look3=unit(dir); local lookU=unit(flat(dir))
-						if lookU.Magnitude<0.05 then lookU=safeUnit(Vector3.new(look3.X,0,look3.Z),Vector3.new(0,0,-1)) end
-						addThreat(list,{
-							kind="lane",cf=CFrame.new(p0),look=look3,maxLen=len,width=beamWidth(beam),
-							vel=ZERO,from=0,to=FAR,dist=d,urgent=d<12,
-							existence=beam:IsA("Beam") and 0.75 or 0.5,intent=0.7,hitProb=0.65,severity=0.7,
-							uncertainty=0.8,source="beam",attackType="beam",instance=beam,
-						})
-					end
-				end
-			end
-		end
-	end
-end
-local function detectAim(list,myPos)
-	if not CFG.DETECT_AIM then return end
-	local R=CFG.DETECT_RADIUS*0.7
-	for model,rec in pairs(actorCache) do
-		if model.Parent and rec.root then
-			local root=rec.root; local d=(root.Position-myPos).Magnitude
-			if d>6 and d<=R then
-				local look=unit(root.CFrame.LookVector)
-				local aim=look:Dot(unit(myPos-root.Position))
-				if aim>0.88 then
-					addThreat(list,{
-						kind="lane",cf=CFrame.new(root.Position),look=look,maxLen=d+5,width=1.8*charScale,
-						vel=ZERO,from=0.05,to=0.55,dist=d,urgent=false,
-						existence=0.4,intent=clamp01((aim-0.85)*5),hitProb=0.35,severity=0.5,
-						uncertainty=1.5,source="aim",attackType="ranged",instance=root,owner=model,
-					})
-				end
-			end
-		end
-	end
-end
-local function detectAttachments(list,myPos,now)
-	if not CFG.DETECT_ATTACHMENTS then return end
-	for att in pairs(attachmentThreats) do
-		if not att.Parent then attachmentThreats[att]=nil
-		else
-			local p=att.WorldPosition; local d=(p-myPos).Magnitude
-			if d<CFG.DETECT_RADIUS*0.5 then
-				local parent=att.Parent
-				local vel=(parent and parent:IsA("BasePart")) and parent.AssemblyLinearVelocity or ZERO
-				addThreat(list,{
-					kind="ell",cf=CFrame.new(p),rf=2,rs=2,ry=2,vel=vel,from=0,to=0.4,dist=d,
-					existence=0.35,intent=0.4,hitProb=0.3,severity=0.5,uncertainty=2,
-					source="attachment",attackType="ranged",instance=att,
-				})
-			end
-		end
-	end
-end
-local function runDetector(name,fn,budgetLeft)
-	local st=detectorState[name]
-	if not st then return budgetLeft end
-	if detectorSkip[name] then diagnostics.skipped[name]=(diagnostics.skipped[name] or 0)+1; return budgetLeft end
-	local now=os.clock()
-	if now-st.last<st.period then return budgetLeft end
-	if budgetLeft<0.08 and st.avgMs>0.15 and now-st.last<0.35 then
-		diagnostics.skipped[name]=(diagnostics.skipped[name] or 0)+1; return budgetLeft
-	end
-	local t0=os.clock()
-	local ok,err=pcall(fn)
-	local ms=(os.clock()-t0)*1000
-	st.last=now; st.avgMs=st.avgMs*0.8+ms*0.2; lastDetectorMs[name]=ms
-	if not ok then
-		st.fails+=1
-		if st.fails>=3 then detectorSkip[name]=true; warn("[AutoDodge] detector disabled:",name,err)
-		elseif lastError~=tostring(err) then lastError=tostring(err); warn("[AutoDodge] detector",name,err) end
-	else st.fails=0 end
-	if ms>1.2 then st.period=math.min(0.25,st.period*1.15)
-	elseif ms<0.25 and st.period>0.033 then st.period=math.max(0.033,st.period*0.92) end
-	return budgetLeft-ms
-end
+						t[#t+1] = {tag=name, attrs=a, children={}}
 
---==============================================================
--- TRACKING + FUSION (spatial/temporal/semantic, stable IDs)
---==============================================================
-local function stableIdFor(th)
-	if th.instance and th.instance.Parent then
-		local ok,id=pcall(function() return th.instance:GetDebugId() end)
-		if ok then return "i:"..tostring(id) end
-	end
-	if th.owner and typeof(th.owner)=="Instance" then
-		local pos=th.cf and th.cf.Position or ZERO
-		local ok,id=pcall(function() return th.owner:GetDebugId() end)
-		return string.format("o:%s:%.0f:%.0f:%s", ok and tostring(id) or "?", pos.X//6, pos.Z//6, th.attackType or "?")
-	end
-	local pos=th.cf and th.cf.Position or ZERO
-	return string.format("s:%.0f:%.0f:%.0f:%s", pos.X//5, pos.Y//5, pos.Z//5, th.attackType or "?")
-end
-local function fuseThreats(raw,now)
-	local clusters={}
-	for _,th in ipairs(raw) do
-		th.threatId=stableIdFor(th)
-		local placed=false
-		for _,cl in ipairs(clusters) do
-			local rep=cl.rep
-			local dp=(th.cf.Position-rep.cf.Position).Magnitude
-			local sameType=th.attackType==rep.attackType
-			local timeOverlap=not (th.to<rep.from-0.15 or th.from>rep.to+0.15)
-			local sameOwner=th.owner and th.owner==rep.owner
-			local sameInst=th.instance and th.instance==rep.instance
-			if sameInst or (dp<7 and timeOverlap and (sameType or sameOwner)) then
-				cl.members[#cl.members+1]=th
-				rep.existence=math.max(rep.existence,th.existence)
-				rep.intent=math.max(rep.intent,th.intent)
-				rep.hitProb=math.max(rep.hitProb,th.hitProb)
-				rep.severity=math.max(rep.severity,th.severity)
-				rep.uncertainty=math.min(rep.uncertainty,th.uncertainty)
-				rep.from=math.min(rep.from,th.from); rep.to=math.max(rep.to,th.to)
-				rep.urgent=rep.urgent or th.urgent
-				if th.dist and (not rep.dist or th.dist<rep.dist) then
-					rep.dist=th.dist; rep.cf=th.cf; rep.vel=th.vel
-				end
-				rep.existence=math.min(1,rep.existence+0.08)
-				placed=true; break
-			end
-		end
-		if not placed then clusters[#clusters+1]={rep=th,members={th}} end
-	end
-	local seen,out={},{}
-	for _,cl in ipairs(clusters) do
-		local th=cl.rep; local id=th.threatId; seen[id]=true
-		local prev=trackStore[id]
-		if prev then
-			th.existence=math.max(th.existence, prev.existence*0.7)
-			th.confidence=th.existence*(0.4+0.6*th.intent)
-			if prev.vel and th.vel then th.vel=prev.vel*0.35+th.vel*0.65 end
-			prev.last=now; prev.existence=th.existence; prev.vel=th.vel; prev.cf=th.cf
-		else
-			trackStore[id]={id=id,last=now,existence=th.existence,vel=th.vel,cf=th.cf,born=now}
-		end
-		out[#out+1]=th
-	end
-	for id,tr in pairs(trackStore) do
-		if not seen[id] then
-			tr.existence*=0.65
-			if tr.existence<0.12 or now-tr.last>1.2 then trackStore[id]=nil end
-		end
-	end
-	return out
-end
-local function riskOf(th)
-	local conf=(th.existence or 0.5)*(th.hitProb or 0.5)
-	local sev=th.severity or 0.5
-	local eta=math.max(th.from or 0.05, 0.04)
-	local urg=th.urgent and 1.4 or 1
-	local unc=1+(th.uncertainty or 0.5)*0.15
-	local tb=1
-	if th.attackType=="projectile" then tb=1.15
-	elseif th.attackType=="beam" then tb=1.1
-	elseif th.attackType=="aoe" then tb=1.2 end
-	return (conf*sev*urg*tb*unc)/eta
-end
-
---==============================================================
--- PLANNER (3D adaptive)
---==============================================================
-local function makeDirs()
-	local dirs={}
-	local n=CFG.COARSE_DIRS or 12
-	for i=0,n-1 do
-		local a=(i/n)*math.pi*2
-		dirs[#dirs+1]=Vector3.new(math.cos(a),0,math.sin(a))
-	end
-	if CFG.PLANNER_3D then
-		dirs[#dirs+1]=Vector3.new(0,1,0)
-		for i=0,3 do
-			local a=(i/4)*math.pi*2
-			dirs[#dirs+1]=unit(Vector3.new(math.cos(a),0.55,math.sin(a)))
-		end
-	end
-	dirs[#dirs+1]=ZERO
-	return dirs
-end
-local function pathClearance(dir,myPos,speed,ths,lift,dash,myVel)
-	local worst,endClear,pen=CAP,CAP,0
-	local lag=totalLag(); local flatVel=myVel and flat(myVel) or ZERO
-	for _,th in ipairs(ths) do
-		local rel=(th.vel or ZERO).Magnitude
-		if rel>=25 and th.cf then
-			local pVel=dir*speed+flatVel*0.25
-			local eta,dist=closestApproach(th.cf.Position,th.vel or ZERO,myPos,pVel)
-			if eta and eta>=(th.from or 0) and eta<=math.min(th.to or CFG.HORIZON,CFG.HORIZON) then
-				local reach=2
-				if th.kind=="box" and th.half then reach=math.max(th.half.X,th.half.Y,th.half.Z)
-				elseif th.kind=="ell" then reach=math.max(th.rf or 0,th.rs or 0)
-				elseif th.kind=="lane" then reach=th.width or 2 end
-				local c=dist-reach-marginOf(th)
-				if c<worst then worst=c end
-				if c<0 then pen+=-c*0.15 end
-			end
-		end
-	end
-	local maxRel=0
-	for _,th in ipairs(ths) do if th.vel then maxRel=math.max(maxRel,th.vel.Magnitude) end end
-	local step=CFG.STEP
-	if maxRel>45 then step=math.max(CFG.MIN_STEP,CFG.STEP*0.4)
-	elseif maxRel>25 then step=math.max(CFG.MIN_STEP,CFG.STEP*0.65) end
-	local t=0
-	while t<=CFG.HORIZON do
-		local travel=travelAt(t,speed,lag,dash)
-		local blend=math.clamp(1-t/0.12,0,1)
-		local point=myPos+dir*travel+flatVel*(t*blend*0.5)
-		if lift and dir.Y>=0 then
-			local tj=math.max(t-0.03,0)
-			point+=Vector3.new(0,math.max(lift.v0*tj-0.5*lift.g*tj*tj,0),0)
-		end
-		if CFG.PLANNER_3D and math.abs(dir.Y)>0.05 then
-			point+=Vector3.new(0,dir.Y*travel*0.35,0)
-		end
-		for _,th in ipairs(ths) do
-			local c=clearanceAt(th,point,t)-marginOf(th)
-			if c<worst then worst=c end
-			if c<0 then pen+=-c*step end
-			if t+step>CFG.HORIZON and c<endClear then endClear=c end
-		end
-		t+=step
-	end
-	return worst,endClear,pen
-end
-local function wallRisk(dir,myPos,speed)
-	if not rayParams or dir.Magnitude<0.1 then return 0 end
-	local dist=math.min(CFG.WALL_RAY,3+speed*0.12)*charScale
-	local hit=Workspace:Spherecast(myPos+Vector3.new(0,1.5*charScale,0),1.1*charScale,unit(flat(dir))*dist,rayParams)
-	if hit then return math.clamp(1-hit.Distance/dist,0,1) end
-	return 0
-end
-local function ledgeRisk(dir,myPos)
-	if not CFG.LEDGE_CHECK or not rayParams or dir.Magnitude<0.1 then return 0 end
-	local probe=myPos+unit(flat(dir))*(3.5*charScale)+Vector3.new(0,1,0)
-	local ground=Workspace:Raycast(probe,Vector3.new(0,-CFG.LEDGE_DEPTH*charScale,0),rayParams)
-	return ground and 0 or 1
-end
-local function scoreDirection(dir,myPos,speed,ths,manual,dash,myVel,isPanic)
-	local lift=nil
-	if dir.Y>0.3 then lift={v0=50,g=workspace.Gravity} end
-	local worst,endClear,pen=pathClearance(dir,myPos,speed,ths,lift,dash,myVel)
-	local survival=clamp01((worst+2)/6)
-	local future=clamp01((endClear+1)/5)
-	local wRisk=wallRisk(dir,myPos,speed)
-	local lRisk=ledgeRisk(dir,myPos)
-	local unc=0; for _,th in ipairs(ths) do unc+=(th.uncertainty or 0) end
-	unc=unc/math.max(#ths,1)
-	local mom=0
-	if myVel then
-		local fv=flat(myVel)
-		if fv.Magnitude>8 and dir.Magnitude>0.1 then mom=unit(fv):Dot(unit(flat(dir))) end
-	end
-	local manualScore=0
-	if manual and manual.Magnitude>0.1 and dir.Magnitude>0.1 then
-		local bias=CFG.MANUAL_BIAS
-		if isPanic then bias*=0.12 elseif worst<0.4 then bias*=0.35 elseif worst>2.5 then bias*=1.25 end
-		manualScore=unit(flat(dir)):Dot(unit(flat(manual)))*bias
-	end
-	local standPen=0
-	if dir.Magnitude<0.08 and worst<1.0 then standPen=isPanic and 6 or 3.5 end
-	local score=survival*6.5+future*2.0-pen*2.2-wRisk*3.0-lRisk*4.0-unc*0.3+mom*0.6+manualScore-standPen
-	if isPanic then score=survival*9-pen*3.5-wRisk*2-lRisk*3+mom*0.3-standPen end
-	return score,worst
-end
-local function refineAround(bestDir,myPos,speed,ths,manual,myVel,isPanic)
-	if not CFG.ADAPTIVE_SAMPLE or bestDir.Magnitude<0.1 then return bestDir,-1e9,CAP end
-	local baseAng=math.atan2(bestDir.Z,bestDir.X)
-	local spread=math.rad(CFG.REFINE_SPREAD or 18)
-	local best,bestScore,bestWorst=bestDir,-1e9,CAP
-	local n=CFG.REFINE_DIRS or 8
-	for i=0,n-1 do
-		local a=baseAng+(i/(n-1)-0.5)*2*spread
-		local d=Vector3.new(math.cos(a),bestDir.Y*0.5,math.sin(a))
-		local sc,w=scoreDirection(d,myPos,speed,ths,manual,nil,myVel,isPanic)
-		if sc>bestScore then bestScore,best,bestWorst=sc,d,w end
-	end
-	return best,bestScore,bestWorst
-end
-local function chooseDirection(myPos,speed,ths,manual,dash,myVel,isPanic)
-	local dirs=makeDirs()
-	local best,bestScore,bestWorst=ZERO,-1e9,CAP
-	local wantJump=false
-	diagnostics.plannerCandidates=#dirs
-	for _,dir in ipairs(dirs) do
-		local sc,w=scoreDirection(dir,myPos,speed,ths,manual,dash,myVel,isPanic)
-		if sc>bestScore then bestScore,best,bestWorst=sc,dir,w end
-	end
-	if best.Magnitude>0.1 then
-		local rb,rs,rw=refineAround(best,myPos,speed,ths,manual,myVel,isPanic)
-		if rs>bestScore then best,bestScore,bestWorst=rb,rs,rw end
-	end
-	if CFG.PLANNER_3D then
-		local jDir=best.Magnitude>0.1 and unit(Vector3.new(best.X,0.7,best.Z)) or Vector3.new(0,1,0)
-		local js,jw=scoreDirection(jDir,myPos,speed,ths,manual,nil,myVel,isPanic)
-		if js>bestScore+0.4 and jw>bestWorst then wantJump=true; best,bestScore,bestWorst=jDir,js,jw end
-	end
-	lastDecision.score=bestScore; lastDecision.worst=bestWorst
-	lastDecision.reason=wantJump and "jump" or (bestWorst<0 and "escape" or "avoid")
-	return best,bestScore,bestWorst,wantJump
-end
-
---==============================================================
--- VALIDATOR
---==============================================================
-local function validateAction(kind,dir,myPos,speed,ths,myVel)
-	if not CFG.VALIDATE_ACTIONS then return true,"ok" end
-	if kind=="move" and (not dir or dir.Magnitude<0.05) then return false,"zero_dir" end
-	local flags=stateFlags(os.clock())
-	if flags.DEAD then return false,"dead" end
-	if kind=="jump" and not flags.CAN_JUMP then return false,"cant_jump" end
-	if kind=="dash" and not flags.CAN_DASH then return false,"cant_dash" end
-	if not flags.CAN_MOVE and kind=="move" then return false,"cant_move" end
-	if rayParams and dir and dir.Magnitude>0.1 then
-		local hit=Workspace:Spherecast(myPos+Vector3.new(0,1.2*charScale,0),1.15*charScale,unit(flat(dir))*(2.2*charScale),rayParams)
-		if hit and hit.Distance<1.6*charScale then return false,"wall" end
-	end
-	if kind~="jump" and ledgeRisk(dir or ZERO,myPos)>0.8 then return false,"ledge" end
-	local look=CFG.VALIDATE_LOOKAHEAD or 0.16
-	local lag=totalLag(); local worst,standWorst=CAP,CAP
-	local t,step=0,math.max(0.03,CFG.STEP)
-	while t<=look do
-		local travel=travelAt(t,speed,lag,kind=="dash" and {speed=CFG.DASH_SPEED,time=CFG.DASH_TIME} or nil)
-		local point=myPos+(dir or ZERO)*travel
-		for _,th in ipairs(ths or {}) do
-			local c=clearanceAt(th,point,t)-marginOf(th); if c<worst then worst=c end
-			local cs=clearanceAt(th,myPos,t)-marginOf(th); if cs<standWorst then standWorst=cs end
-		end
-		t+=step
-	end
-	if worst<-0.6 and worst<standWorst-0.35 then return false,"deeper_into_threat" end
-	return true,"ok"
-end
-
---==============================================================
--- GATHER
---==============================================================
-local function gather(now)
-	local list={}
-	local myPos=Move and Move:GetPosition() or (Root and Root.Position) or ZERO
-	local myVel=Move and Move:GetVelocity() or ZERO
-	local budget=CFG.DETECTOR_BUDGET_MS
-	if perfLow then budget*=0.55 end
-	for i=#manualThreats,1,-1 do
-		local m=manualThreats[i]
-		if now>m.endT then table.remove(manualThreats,i)
-		else
-			local d=(m.cf.Position-myPos).Magnitude
-			if d-(m.reach or 2)<=CFG.DETECT_RADIUS then
-				addThreat(list,{
-					kind=m.kind,cf=m.cf,half=m.half,rf=m.rf,rs=m.rs,ry=m.ry,radius=m.radius,
-					look=m.look,width=m.width,maxLen=m.maxLen,vel=m.vel or ZERO,
-					from=math.max(0,m.startT-now),to=m.endT-now,dist=d,urgent=m.urgent,
-					existence=m.confidence or 1,intent=1,hitProb=0.9,severity=0.8,uncertainty=0.2,
-					source="manual",attackType=m.attackType or "manual",
-				})
-			end
-		end
-	end
-	budget=runDetector("actor",function() detectActors(list,myPos,now) end,budget)
-	budget=runDetector("projectile",function() detectProjectiles(list,myPos,now,myVel) end,budget)
-	budget=runDetector("parts",function() detectParts(list,myPos,now,myVel) end,budget)
-	budget=runDetector("beam",function() detectBeams(list,myPos,now) end,budget)
-	budget=runDetector("aim",function() detectAim(list,myPos) end,budget)
-	budget=runDetector("attachment",function() detectAttachments(list,myPos,now) end,budget)
-	if perfLow then
-		detectorSkip.attachment=true
-		detectorSkip.aim=thinkAvg>CFG.PERF_BUDGET_MS*0.9
-	else
-		detectorSkip.attachment=false; detectorSkip.aim=false
-		for name,st in pairs(detectorState) do
-			if detectorSkip[name] and st.fails<3 and os.clock()-st.last>2 then
-				detectorSkip[name]=false; st.fails=0
-			end
-		end
-	end
-	list=fuseThreats(list,now)
-	table.sort(list,function(a,b) return riskOf(a)>riskOf(b) end)
-	if #list>CFG.MAX_THREATS then
-		local t={} for i=1,CFG.MAX_THREATS do t[i]=list[i] end; list=t
-	end
-	diagnostics.threatsBySource={}
-	for _,th in ipairs(list) do
-		local s=th.source or "?"
-		diagnostics.threatsBySource[s]=(diagnostics.threatsBySource[s] or 0)+1
-	end
-	return list
-end
-
---==============================================================
--- LEARNING (cautious)
---==============================================================
-local function updateLearned(id,hitAt)
-	if not id or id=="" then return end
-	local L=learned[id]
-	if not L then L={n=0,mean=hitAt,m2=0,last=os.clock()}; learned[id]=L end
-	L.n+=1; local n=L.n; local delta=hitAt-L.mean
-	L.mean+=delta/n; L.m2+=delta*(hitAt-L.mean); L.last=os.clock()
-	if n>4 then
-		local std=math.sqrt(math.max(L.m2/math.max(n-1,1),1e-6))
-		if math.abs(hitAt-L.mean)>3*std then L.mean-=delta/n*0.5 end
-	end
-end
-local function learnFromHit(myPos)
-	if not CFG.AUTO_LEARN or perfLow then return end
-	local now=os.clock()
-	local candidates={}
-	for model,rec in pairs(actorCache) do
-		if model.Parent and rec.root and (rec.root.Position-myPos).Magnitude<28 then
-			local animator=rec.hum and rec.hum:FindFirstChildOfClass("Animator")
-			if animator then
-				for _,track in ipairs(animator:GetPlayingAnimationTracks()) do
-					if track.IsPlaying then
-						local id=""
-						pcall(function() id=track.Animation and tostring(track.Animation.AnimationId):match("%d+") or "" end)
-						if id~="" then
-							local facing=0
-							local look=unit(flat(rec.root.CFrame.LookVector))
-							local toMe=flat(myPos-rec.root.Position)
-							if look.Magnitude>0.1 and toMe.Magnitude>0.1 then facing=look:Dot(unit(toMe)) end
-							candidates[#candidates+1]={id=id,dist=(rec.root.Position-myPos).Magnitude,pos=track.TimePosition,facing=facing}
+						if closed:byte(1) ~= slashchar then
+							l[#l+1] = t
+							t = t[#t].children
 						end
+
+						addtext(txt)
+						-- close
+					elseif '/' == type then
+						t = l[#l]
+						l[#l] = nil
+
+						addtext(txt)
+						-- ENTITY
+					elseif '!' == type then
+						if E == name:byte(1) then
+							txt:gsub('([_%w]+)%s+(.)(.-)%2', function(name, q, entity)
+								entities[#entities+1] = {name=name, value=entity}
+							end, 1)
+						end
+						-- elseif '?' == type then
+						--	 print('?	' .. name .. ' // ' .. attrs .. '$$')
+						-- elseif '-' == type then
+						--	 print('comment	' .. name .. ' // ' .. attrs .. '$$')
+						-- else
+						--	 print('o	' .. #p .. ' // ' .. name .. ' // ' .. attrs .. '$$')
+					end
+				end)
+
+				return {children=t, entities=entities, tentities=tentities}
+			end
+
+			function parseText(txt)
+				return parse(txt)
+			end
+
+			function defaultEntityTable()
+				return { quot='"', apos='\'', lt='<', gt='>', amp='&', tab='\t', nbsp=' ', }
+			end
+
+			function replaceEntities(s, entities)
+				return s:gsub('&([^;]+);', entities)
+			end
+
+			function createEntityTable(docEntities, resultEntities)
+				entities = resultEntities or defaultEntityTable()
+				for _,e in pairs(docEntities) do
+					e.value = replaceEntities(e.value, entities)
+					entities[e.name] = e.value
+				end
+				return entities
+			end
+
+			return parseText
+		end
+		local newEnv = setmetatable({},{__index = getfenv()})
+		setfenv(func,newEnv)
+		return func()
+	end)()
+
+	Lib.FastWait = function(s)
+		if not s then return signalWait(renderStepped) end
+		local start = tick()
+		while tick() - start < s do signalWait(renderStepped) end
+	end
+
+	Lib.ButtonAnim = function(button,data)
+		local holding = false
+		local disabled = false
+		local mode = data and data.Mode or 1
+		local control = {}
+
+		if mode == 2 then
+			local lerpTo = data.LerpTo or Color3.new(0,0,0)
+			local delta = data.LerpDelta or 0.2
+			control.StartColor = data.StartColor or button.BackgroundColor3
+			control.PressColor = data.PressColor or control.StartColor:lerp(lerpTo,delta)
+			control.HoverColor = data.HoverColor or control.StartColor:lerp(control.PressColor,0.6)
+			control.OutlineColor = data.OutlineColor
+		end
+
+		button.InputBegan:Connect(function(input)
+			if disabled then return end
+
+			if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+				if not holding then
+					if mode == 1 then
+						button.BackgroundTransparency = 0.4
+					elseif mode == 2 then
+						button.BackgroundColor3 = control.HoverColor
 					end
 				end
-			end
-		end
-	end
-	table.sort(candidates,function(a,b) return (a.facing*2-a.dist*0.05)>(b.facing*2-b.dist*0.05) end)
-	local top=candidates[1]
-	if top and top.facing>0.15 and top.dist<22 then
-		updateLearned(top.id,top.pos)
-		if CFG.COMBO_LEARN and lastLearnedAnim and lastLearnedAnim~=top.id and now-lastLearnedAt<1.3 then
-			local g=comboGraph[lastLearnedAnim]; if not g then g={}; comboGraph[lastLearnedAnim]=g end
-			local e=g[top.id]; if not e then e={n=0,last=now}; g[top.id]=e end
-			e.n+=1; e.last=now
-			local bestN,bestC=nil,0
-			for nid,rec in pairs(g) do
-				local weight=rec.n*(CFG.COMBO_DECAY^((now-(rec.last or now))/10))
-				if weight>bestC then bestN,bestC=nid,weight end
-			end
-			if bestN and bestC>=CFG.COMBO_MIN_OBS then
-				predictedNextAnim=bestN; predictedNextUntil=now+0.7
-			end
-		end
-		lastLearnedAnim=top.id; lastLearnedAt=now
-		learnedCount=0; for _ in pairs(learned) do learnedCount+=1 end
-	end
-end
-
---==============================================================
--- THINK / FSM / EXECUTION
---==============================================================
-local function setFSM(s) fsmState=s end
-local function getManualDirection(now)
-	if not Move then return ZERO end
-	local md=flat(Move:GetMoveDirection())
-	if md.Magnitude>0.1 then lastManual,lastManualTime=unit(md),now; return lastManual end
-	if now-lastManualTime<0.2 then return lastManual end
-	return ZERO
-end
-local function dodgeSpeed()
-	local s=Move and Move:GetSpeed() or baseSpeed
-	if panic then return s*math.min(CFG.SPEED_MULT*1.08,CFG.SPEED_BOOST_CAP) end
-	if active then return s*CFG.SPEED_MULT end
-	return s
-end
-local function think(now)
-	updatePing(now)
-	if not enabled then
-		setFSM(FSM.DISABLED); threats={}; active,panic,jumpPlanned=false,false,false; targetDir=ZERO; return
-	end
-	local flags=stateFlags(now)
-	if flags.DEAD or flags.INVULNERABLE or flags.STUNNED or suspendHeld or now<hardPauseUntil or (flags.BUSY and not panic) then
-		setFSM(FSM.PAUSED); threats={}; active,panic,jumpPlanned=false,false,false; targetDir=ZERO; dashUntil=0; return
-	end
-	if now<recoveryUntil and not panic then
-		setFSM(FSM.RECOVERY)
-		threats=gather(now)
-		local myPos=Move:GetPosition(); local myVelFlat=flat(Move:GetVelocity())
-		local urgentHit=nil
-		for _,th in ipairs(threats) do
-			if th.urgent or (th.existence or 0)*(th.hitProb or 0)>0.45 then
-				local t=0
-				while t<=CFG.PANIC_TIME+0.08 do
-					if clearanceAt(th,myPos+myVelFlat*t,t)-marginOf(th)<0 then urgentHit=t; break end
-					t+=CFG.STEP
+			elseif input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				holding = true
+				if mode == 1 then
+					button.BackgroundTransparency = 0
+				elseif mode == 2 then
+					button.BackgroundColor3 = control.PressColor
+					if control.OutlineColor then button.BorderColor3 = control.PressColor end
 				end
 			end
-		end
-		if urgentHit and urgentHit<=CFG.PANIC_TIME then recoveryUntil=0
-		else
-			active=#threats>0 and now<dodgeUntil
-			if not active then
-				targetDir=ZERO
-				if boosted and Move and CFG.ENABLE_SPEED_BOOST and not gameCaps.SPEED_OWNED_BY_GAME then
-					local sp=Move:GetSpeed()
-					if math.abs(sp-baseSpeed)<0.4 then Move:SetSpeed(baseSpeed); boosted=false
-					else Move:SetSpeed(baseSpeed+(sp-baseSpeed)*0.5) end
-				end
-				lastStats={threats=#threats,tHit=nil}; return
-			end
-		end
-	end
-	local myPos=Move:GetPosition()
-	setFSM(FSM.OBSERVE)
-	threats=gather(now)
-	local myVelFlat=flat(Move:GetVelocity())
-	local tHit,tUrgent=nil,nil
-	for _,th in ipairs(threats) do
-		local step=math.max(CFG.STEP,0.025)
-		local t,prevSafe=0,0
-		while t<=CFG.HORIZON do
-			if clearanceAt(th,myPos+myVelFlat*t,t)-marginOf(th)<0 then
-				local lo,hi=prevSafe,t
-				for _=1,4 do
-					local mid=(lo+hi)*0.5
-					if clearanceAt(th,myPos+myVelFlat*mid,mid)-marginOf(th)<0 then hi=mid else lo=mid end
-				end
-				if not tHit or hi<tHit then tHit=hi end
-				if th.urgent and (not tUrgent or hi<tUrgent) then tUrgent=hi end
-				break
-			end
-			prevSafe=t; t+=step
-		end
-	end
-	lastStats={threats=#threats,tHit=tHit}
-	if #threats==0 then
-		if active or now<dodgeUntil then
-			recoveryUntil=now+CFG.RECOVERY_TIME; recoveryDir=targetDir; dodgeUntil=0; setFSM(FSM.RECOVERY)
-		else setFSM(FSM.IDLE) end
-		active,panic=false,false; targetDir=ZERO; return
-	end
-	setFSM(FSM.THREAT)
-	if tHit and tHit<=CFG.TRIGGER_TIME then dodgeUntil=now+CFG.HOLD_TIME end
-	if CFG.COMBO_LEARN and predictedNextAnim and now<predictedNextUntil and tHit then
-		dodgeUntil=math.max(dodgeUntil,now+0.08)
-	end
-	panic=tUrgent~=nil and tUrgent<=CFG.PANIC_TIME
-	active=#threats>0 and now<dodgeUntil
-	if not active then setFSM(FSM.OBSERVE); targetDir=ZERO; panic=false; return end
-	setFSM(panic and FSM.PANIC or FSM.EVAL)
-	local speed=dodgeSpeed()
-	local manual=getManualDirection(now)
-	local myVel=Move:GetVelocity()
-	local commit=panic and CFG.PANIC_COMMIT_TIME or CFG.COMMIT_TIME
-	local since=now-lastChoose
-	local need=targetDir.Magnitude<0.1 or since>=commit
-	if targetDir.Magnitude>0.1 and not need then
-		local curScore,curWorst=scoreDirection(targetDir,myPos,speed,threats,manual,nil,myVel,panic)
-		if curWorst<-0.2 then need=true
-		elseif since>=0.06 then
-			local trial=chooseDirection(myPos,speed,threats,manual,nil,myVel,panic)
-			local trialScore=scoreDirection(trial,myPos,speed,threats,manual,nil,myVel,panic)
-			if trialScore>curScore+CFG.HYSTERESIS then need=true end
-		end
-	end
-	if need then
-		local dir,sc,_,wantJump=chooseDirection(myPos,speed,threats,manual,nil,myVel,panic)
-		if targetDir.Magnitude>0.1 and dir.Magnitude>0.1 then
-			if unit(flat(dir)):Dot(unit(flat(targetDir)))>(1-CFG.DEAD_ZONE) then dir=targetDir end
-		end
-		local okV=validateAction("move",dir,myPos,speed,threats,myVel)
-		if okV and dir.Magnitude>0.1 then targetDir=dir; lastChoose=now
-		elseif not okV then
-			diagnostics.rejects[#diagnostics.rejects+1]="move_rejected"
-			if #diagnostics.rejects>8 then table.remove(diagnostics.rejects,1) end
-		end
-		jumpPlanned=wantJump; setFSM(FSM.DODGE)
-	end
-	if CFG.ENABLE_SPEED_BOOST and not gameCaps.SPEED_OWNED_BY_GAME and Move then
-		Move:SetSpeed(baseSpeed*(panic and math.min(CFG.SPEED_MULT*1.08,CFG.SPEED_BOOST_CAP) or CFG.SPEED_MULT))
-		boosted=true
-	end
-	if jumpPlanned and flags.CAN_JUMP and now-lastJump>=CFG.JUMP_COOLDOWN and Move:CanJump() then
-		local okJ=validateAction("jump",targetDir.Magnitude>0.1 and targetDir or Vector3.new(0,0,-1),myPos,speed,threats,myVel)
-		if okJ then
-			Move:Jump()
-			if type(CFG.ActionHook)=="function" then pcall(CFG.ActionHook,"jump",targetDir,1) end
-			lastJump=now; diagnostics.chosen="jump"
-		end
-		jumpPlanned=false
-	end
-	if CFG.DASH_ENABLED and panic and flags.CAN_DASH and now>=dashUntil and now-lastDash>=CFG.DASH_COOLDOWN
-		and now-lastJump>0.55 and (CFG.DASH_IN_AIR or Move:CanJump()) and targetDir.Magnitude>0.1 then
-		local ns,nw=scoreDirection(targetDir,myPos,speed,threats,manual,nil,myVel,true)
-		if nw<CFG.DASH_NEED then
-			local dash={speed=CFG.DASH_SPEED,time=CFG.DASH_TIME}
-			local dd,ds=chooseDirection(myPos,speed,threats,manual,dash,myVel,true)
-			if dd.Magnitude>0.1 and ds>ns+CFG.DASH_GAIN then
-				local okD=validateAction("dash",dd,myPos,speed,threats,myVel)
-				if okD then
-					dashDir=dd; dashUntil=now+CFG.DASH_TIME; lastDash=now
-					targetDir,curDir,lastChoose=dd,dd,now
-					dodgeUntil=math.max(dodgeUntil,dashUntil+0.1)
-					if Move.Dash then Move:Dash(dd,CFG.DASH_SPEED) end
-					if CFG.DASH_HOOK then pcall(CFG.DASH_HOOK,dd,1) end
-					if type(CFG.ActionHook)=="function" then pcall(CFG.ActionHook,"dash",dd,1) end
-					diagnostics.chosen="dash"
-				end
-			end
-		end
-	end
-	if CFG.DEBUG then
-		print(string.format("[AutoDodge] %s th=%d tHit=%s",fsmState,#threats,tHit and string.format("%.2f",tHit) or "-"))
-	end
-end
-local function advanceMovement(dt)
-	if not active or targetDir.Magnitude<0.05 then curDir=ZERO; finalDir=ZERO; return end
-	local alpha=1-math.exp(-CFG.SMOOTH*dt)
-	if curDir.Magnitude<0.05 then curDir=targetDir else curDir=curDir:Lerp(targetDir,alpha) end
-	if (curDir-finalDir).Magnitude>=CFG.DEAD_ZONE*0.5 or finalDir.Magnitude<0.1 then finalDir=curDir end
-	if dashWas or os.clock()<dashUntil then
-		finalDir=dashDir.Magnitude>0.1 and dashDir or finalDir
-		dashWas=os.clock()<dashUntil
-	end
-end
-local function applyMove()
-	if not Move or not active then return end
-	if finalDir.Magnitude>0.1 then
-		if dashWas and rayParams then
-			local hit=Workspace:Spherecast(Move:GetPosition()+Vector3.new(0,1,0),1.1,unit(flat(finalDir))*2.5,rayParams)
-			if hit and hit.Distance<1.4 then dashUntil=0; dashWas=false end
-		end
-		Move:Move(unit(flat(finalDir)))
-		if type(CFG.ActionHook)=="function" then pcall(CFG.ActionHook,"move",finalDir,panic and 1 or 0.5) end
-	end
-end
-
---==============================================================
--- CHARACTER LIFECYCLE
---==============================================================
-local function resetState()
-	threats={}; active,panic,jumpPlanned=false,false,false
-	targetDir,curDir,finalDir=ZERO,ZERO,ZERO
-	dodgeUntil,lastChoose,lastThink=0,0,0; dashUntil,dashWas=0,false
-	recoveryUntil=0; recoveryDir=ZERO; fsmState=FSM.IDLE; table.clear(trackStore)
-end
-local function setupCharacter(char)
-	for _,c in ipairs(charConns) do pcall(function() c:Disconnect() end) end
-	table.clear(charConns)
-	Character=char
-	Humanoid=char:WaitForChild("Humanoid",5)
-	Root=getRoot(char)
-	if not Humanoid or not Root then return end
-	rayParams=RaycastParams.new()
-	rayParams.FilterType=Enum.RaycastFilterType.Exclude
-	rayParams.FilterDescendantsInstances={char}
-	bindMovementAdapter(CFG.MovementAdapter)
-	baseSpeed=Move:GetSpeed(); updateCharScale(); resetState()
-	local lastHp=Humanoid.Health
-	charConns[#charConns+1]=Humanoid.HealthChanged:Connect(function(hp)
-		if hp<lastHp-1 then learnFromHit(Move and Move:GetPosition() or Root.Position) end
-		lastHp=hp
-	end)
-	charConns[#charConns+1]=Humanoid.Died:Connect(resetState)
-	local function hookTool(tool)
-		if not tool:IsA("Tool") then return end
-		local function release() toolDown[tool]=nil end
-		charConns[#charConns+1]=tool.Activated:Connect(function() toolDown[tool]=true end)
-		charConns[#charConns+1]=tool.Deactivated:Connect(release)
-		charConns[#charConns+1]=tool.Unequipped:Connect(release)
-		charConns[#charConns+1]=tool.Destroying:Connect(release)
-		charConns[#charConns+1]=tool.AncestryChanged:Connect(function()
-			if not tool:IsDescendantOf(Character) then release() end
 		end)
-	end
-	for _,ch in ipairs(char:GetChildren()) do hookTool(ch) end
-	charConns[#charConns+1]=char.ChildAdded:Connect(hookTool)
-end
-local function buildGui()
-	if not CFG.SHOW_UI or not IS_CLIENT then return end
-	local pg=LocalPlayer:WaitForChild("PlayerGui",10); if not pg then return end
-	local old=pg:FindFirstChild("AutoDodgeUI"); if old then old:Destroy() end
-	gui=Instance.new("ScreenGui"); gui.Name="AutoDodgeUI"; gui.ResetOnSpawn=false; gui.Parent=pg
-	toggleBtn=Instance.new("TextButton")
-	toggleBtn.Size=UDim2.new(0,100,0,32); toggleBtn.Position=UDim2.new(1,-110,0,12)
-	toggleBtn.BackgroundColor3=Color3.fromRGB(30,120,60); toggleBtn.TextColor3=Color3.new(1,1,1)
-	toggleBtn.Font=Enum.Font.GothamBold; toggleBtn.TextSize=14; toggleBtn.Text="УВОРОТ"; toggleBtn.Parent=gui
-	Instance.new("UICorner",toggleBtn).CornerRadius=UDim.new(0,6)
-	hudLabel=Instance.new("TextLabel")
-	hudLabel.Size=UDim2.new(0,200,0,54); hudLabel.Position=UDim2.new(1,-210,0,48)
-	hudLabel.BackgroundTransparency=0.45; hudLabel.BackgroundColor3=Color3.fromRGB(0,0,0)
-	hudLabel.TextColor3=Color3.new(1,1,1); hudLabel.Font=Enum.Font.Code; hudLabel.TextSize=12
-	hudLabel.TextXAlignment=Enum.TextXAlignment.Left; hudLabel.Text=""; hudLabel.Parent=gui
-	Instance.new("UICorner",hudLabel).CornerRadius=UDim.new(0,4)
-	toggleBtn.MouseButton1Click:Connect(function() AutoDodgeModule.SetEnabled(not enabled) end)
-end
-local function updateHud()
-	if not hudLabel then return end
-	hudLabel.Text=string.format("%s | %s: %d\n%s | tHit:%s\n%s: %d | %s",
-		enabled and TXT.on or TXT.off, TXT.threats, lastStats.threats, fsmState,
-		lastStats.tHit and string.format("%.2f",lastStats.tHit) or "-",
-		TXT.learned, learnedCount, gameCaps.ARCHETYPE)
-	if toggleBtn then toggleBtn.BackgroundColor3=enabled and Color3.fromRGB(30,120,60) or Color3.fromRGB(100,40,40) end
-end
-local function autoBootstrap()
-	if bootstrapDone then return end; bootstrapDone=true
-	local tags,actors,beams=0,0,0
-	for _ in pairs(flaggedParts) do tags+=1 end
-	for _ in pairs(actorCache) do actors+=1 end
-	for _ in pairs(beamThreats) do beams+=1 end
-	gameCaps.HAS_TAGS=tags>0; gameCaps.HAS_BEAMS=beams>0; gameCaps.HAS_HUMANOID=Humanoid~=nil
-	if actors>0 and gameCaps.HAS_PROJECTILES then gameCaps.ARCHETYPE="COMBAT_MIXED"
-	elseif gameCaps.HAS_PROJECTILES then gameCaps.ARCHETYPE="RANGED"
-	elseif beams>0 then gameCaps.ARCHETYPE="BEAM"
-	elseif actors>0 then gameCaps.ARCHETYPE="MELEE"
-	else gameCaps.ARCHETYPE="GENERIC" end
-	if gameCaps.ARCHETYPE=="RANGED" then CFG.DETECT_RADIUS=math.max(CFG.DETECT_RADIUS,70); CFG.HORIZON=math.max(CFG.HORIZON,1.0)
-	elseif gameCaps.ARCHETYPE=="MELEE" then CFG.TRIGGER_TIME=math.max(CFG.TRIGGER_TIME,0.38) end
-	pcall(function() LocalPlayer:SetAttribute("AutoDodgeArchetype",gameCaps.ARCHETYPE) end)
-end
-local function cleanup()
-	sessionId+=1
-	pcall(function() RunService:UnbindFromRenderStep("AutoDodgeMove") end)
-	for _,c in ipairs(rootConns) do pcall(function() c:Disconnect() end) end
-	for _,c in ipairs(charConns) do pcall(function() c:Disconnect() end) end
-	for _,c in ipairs(registryConns) do pcall(function() c:Disconnect() end) end
-	table.clear(rootConns); table.clear(charConns); table.clear(registryConns)
-	table.clear(trackStore); table.clear(comboGraph); table.clear(lastDetectorMs); table.clear(detectorSkip)
-	if gui then pcall(function() gui:Destroy() end); gui=nil end
-	if boosted and Move and not gameCaps.SPEED_OWNED_BY_GAME then pcall(function() Move:SetSpeed(baseSpeed) end) end
-	boosted=false; running=false; resetState(); Move=nil
-end
-local function setEnabled(v)
-	enabled=v and true or false
-	pcall(function() LocalPlayer:SetAttribute("AutoDodgeEnabled",enabled) end)
-	if not enabled then
-		active,panic=false,false; targetDir=ZERO
-		if boosted and Move then Move:SetSpeed(baseSpeed); boosted=false end
-	end
-	updateHud()
-end
-function AutoDodgeModule.Start(overrides)
-	if not IS_CLIENT then warn("[AutoDodge] client only"); return AutoDodgeModule end
-	if running then return AutoDodgeModule end
-	CFG=deepCopy(DEFAULT_CFG)
-	if type(overrides)=="table" then for k,v in pairs(overrides) do CFG[k]=v end end
-	if CFG.MODE then applyMode(CFG.MODE) end
-	validateConfig()
-	if not CFG.ENABLED then return AutoDodgeModule end
-	enabled=CFG.START_ENABLED; running=true; sessionId+=1
-	local mySession=sessionId; bootstrapDone=false
-	runSelfTests(); bindMovementAdapter(CFG.MovementAdapter)
-	pcall(function() LocalPlayer:SetAttribute("AutoDodgeEnabled",enabled) end)
-	rootConns[#rootConns+1]=LocalPlayer:GetAttributeChangedSignal("AutoDodgeEnabled"):Connect(function()
-		if sessionId~=mySession then return end
-		local v=LocalPlayer:GetAttribute("AutoDodgeEnabled")
-		if type(v)=="boolean" then setEnabled(v) end
-	end)
-	rootConns[#rootConns+1]=UserInputService.InputBegan:Connect(function(input,processed)
-		if sessionId~=mySession or processed then return end
-		if CFG.TOGGLE_KEY and input.KeyCode==CFG.TOGGLE_KEY then setEnabled(not enabled)
-		elseif CFG.PAUSE_KEY and input.KeyCode==CFG.PAUSE_KEY then hardPauseUntil=os.clock()+0.4 end
-	end)
-	task.spawn(function() if sessionId==mySession then pcall(buildGui) end end)
-	startRegistries()
-	task.spawn(function()
-		if sessionId~=mySession then return end; task.wait(0.5)
-		if sessionId==mySession then pcall(autoBootstrap) end
-	end)
-	local function onChar(char) if sessionId==mySession then setupCharacter(char) end end
-	if LocalPlayer.Character then onChar(LocalPlayer.Character) end
-	rootConns[#rootConns+1]=LocalPlayer.CharacterAdded:Connect(onChar)
-	rootConns[#rootConns+1]=RunService.Heartbeat:Connect(function()
-		if sessionId~=mySession or not running or not Move or not Root then return end
-		local now=os.clock()
-		local rate=CFG.THINK_RATE
-		if perfLow then rate=math.min(CFG.THINK_RATE_MAX,rate*1.6) end
-		if now-lastThink<rate then return end
-		local t0=os.clock()
-		local ok,err=pcall(think,now)
-		local ms=(os.clock()-t0)*1000
-		thinkAvg=thinkAvg*0.85+ms*0.15
-		perfLow=thinkAvg>CFG.PERF_BUDGET_MS
-		if thinkAvg>CFG.PERF_BUDGET_MS then CFG.THINK_RATE=math.min(CFG.THINK_RATE_MAX,CFG.THINK_RATE*1.05)
-		elseif thinkAvg<CFG.PERF_BUDGET_MS*0.5 then CFG.THINK_RATE=math.max(CFG.THINK_RATE_MIN,CFG.THINK_RATE*0.98) end
-		lastThink=now
-		if not ok and lastError~=tostring(err) then lastError=tostring(err); warn("[AutoDodge] think:",err) end
-		updateHud()
-	end)
-	RunService:BindToRenderStep("AutoDodgeMove",Enum.RenderPriority.Last.Value,function(dt)
-		if sessionId~=mySession or not running then return end
-		advanceMovement(dt); applyMove()
-	end)
-	return AutoDodgeModule
-end
-function AutoDodgeModule.Stop() cleanup(); return AutoDodgeModule end
-function AutoDodgeModule.SetEnabled(v) setEnabled(v); return AutoDodgeModule end
-function AutoDodgeModule.IsEnabled() return enabled end
-local function apiAdd(kind,cf,sizeOrRadius,duration,delay,extra)
-	duration=duration or 0.4; delay=delay or 0; local now=os.clock()
-	local th={kind=kind,cf=typeof(cf)=="CFrame" and cf or CFrame.new(cf),
-		startT=now+delay,endT=now+delay+duration,vel=ZERO,urgent=true,confidence=1,reach=2,attackType="manual"}
-	if kind=="box" then
-		th.half=typeof(sizeOrRadius)=="Vector3" and sizeOrRadius*0.5 or Vector3.new(2,2,2); th.reach=th.half.Magnitude
-	elseif kind=="sphere" or kind=="ell" then
-		th.kind="ell"; local r=type(sizeOrRadius)=="number" and sizeOrRadius or 3
-		th.rf,th.rs,th.ry=r,r,r; th.reach=r
-	elseif kind=="ray" or kind=="lane" then
-		th.kind="lane"; th.look=(extra and extra.look) or Vector3.new(0,0,-1)
-		th.width=(extra and extra.width) or 2; th.maxLen=type(sizeOrRadius)=="number" and sizeOrRadius or 40; th.reach=th.width
-	end
-	if type(extra)=="table" then for k,v in pairs(extra) do th[k]=v end end
-	manualThreats[#manualThreats+1]=th; return #manualThreats
-end
-AutoDodgeModule.AddBox=function(cf,size,duration,delay,extra) return apiAdd("box",cf,size,duration,delay,extra) end
-AutoDodgeModule.AddSphere=function(cf,radius,duration,delay,extra) return apiAdd("sphere",cf,radius,duration,delay,extra) end
-AutoDodgeModule.AddRay=function(origin,look,length,width,duration,delay)
-	return apiAdd("lane",typeof(origin)=="CFrame" and origin or CFrame.new(origin),length,duration,delay,{look=unit(look or Vector3.new(0,0,-1)),width=width or 2})
-end
-AutoDodgeModule.RemoveThreat=function(idx) if type(idx)=="number" and manualThreats[idx] then table.remove(manualThreats,idx) end end
-AutoDodgeModule.ClearThreats=function() table.clear(manualThreats) end
-AutoDodgeModule.Busy=function(seconds) busyUntil=math.max(busyUntil,os.clock()+(seconds or 0.4)) end
-AutoDodgeModule.Pause=function(seconds) hardPauseUntil=math.max(hardPauseUntil,os.clock()+(seconds or 1)) end
-AutoDodgeModule.Resume=function() hardPauseUntil=0; suspendHeld=false; busyUntil=0 end
-AutoDodgeModule.SetMovementAdapter=function(ad) CFG.MovementAdapter=ad; bindMovementAdapter(ad); if Move then baseSpeed=Move:GetSpeed() end end
-AutoDodgeModule.GetMovementAdapter=function() return Move end
-AutoDodgeModule.GetGameCapabilities=function() return gameCaps end
-AutoDodgeModule.GetState=function()
-	return fsmState,{active=active,panic=panic,recovery=os.clock()<recoveryUntil,threats=#threats,tHit=lastStats.tHit,thinkMs=thinkAvg}
-end
-AutoDodgeModule.SetConfig=function(patch)
-	if type(patch)~="table" then return false end
-	for k,v in pairs(patch) do CFG[k]=v end; validateConfig(); return true
-end
-AutoDodgeModule.GetComboGraph=function() return comboGraph end
-AutoDodgeModule.GetDiagnostics=function()
-	return {detectorMs=lastDetectorMs,skipped=diagnostics.skipped,threatsBySource=diagnostics.threatsBySource,
-		plannerCandidates=diagnostics.plannerCandidates,chosen=diagnostics.chosen,rejects=diagnostics.rejects,
-		thinkAvg=thinkAvg,fsm=fsmState,perfLow=perfLow}
-end
-AutoDodgeModule.Discover=function(radius)
-	local L={string.format("===== AutoDodge Discover arch=%s =====",gameCaps.ARCHETYPE)}
-	local n=0
-	for part in pairs(flaggedParts) do
-		if part.Parent then L[#L+1]="FLAG "..part:GetFullName(); n+=1; if n>40 then break end end
-	end
-	return table.concat(L,"\n")
-end
-AutoDodgeModule.DumpLearned=function()
-	local L={"===== Learned ====="}
-	for id,rec in pairs(learned) do L[#L+1]=string.format("%s n=%d mean=%.3f",id,rec.n,rec.mean) end
-	return table.concat(L,"\n")
-end
-AutoDodgeModule.DumpProfile=function()
-	return string.format("Place=%s Arch=%s Margin=%.2f Trigger=%.2f Think=%.3f Threats=%d Learned=%d",
-		tostring(game.PlaceId),gameCaps.ARCHETYPE,CFG.MARGIN,CFG.TRIGGER_TIME,CFG.THINK_RATE,#threats,learnedCount)
-end
-AutoDodgeModule.HookRemote=function(remote,handler)
-	if type(handler)~="function" then return end
-	local sid=sessionId
-	task.spawn(function()
-		if type(remote)=="string" then
-			local rs=game:GetService("ReplicatedStorage"); local name,t0=remote,os.clock(); remote=nil
-			while not remote and os.clock()-t0<15 do
-				if sessionId~=sid or not running then return end
-				remote=rs:FindFirstChild(name,true); if not remote then task.wait(0.5) end
+
+		button.InputEnded:Connect(function(input)
+			if disabled then return end
+
+			if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+				if not holding then
+					if mode == 1 then
+						button.BackgroundTransparency = 1
+					elseif mode == 2 then
+						button.BackgroundColor3 = control.StartColor
+					end
+				end
+			elseif input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				holding = false
+				if mode == 1 then
+					button.BackgroundTransparency = Lib.CheckMouseInGui(button) and 0.4 or 1
+				elseif mode == 2 then
+					button.BackgroundColor3 = Lib.CheckMouseInGui(button) and control.HoverColor or control.StartColor
+					if control.OutlineColor then button.BorderColor3 = control.OutlineColor end
+				end
+			end
+		end)
+
+		control.Disable = function()
+			disabled = true
+			holding = false
+
+			if mode == 1 then
+				button.BackgroundTransparency = 1
+			elseif mode == 2 then
+				button.BackgroundColor3 = control.StartColor
 			end
 		end
-		if sessionId~=sid or not running then return end
-		if typeof(remote)=="Instance" and remote:IsA("RemoteEvent") then
-			rootConns[#rootConns+1]=remote.OnClientEvent:Connect(function(...)
-				if sessionId~=sid then return end; pcall(handler,...)
-			end)
+
+		control.Enable = function()
+			disabled = false
 		end
-	end)
-end
-AutoDodgeModule.CFG=CFG
-AutoDodgeModule.FSM=FSM
-if IS_CLIENT then shared.AutoDodge=AutoDodgeModule end
-if IS_CLIENT and script:IsA("LocalScript") then task.defer(function() AutoDodgeModule.Start() end) end
-return AutoDodgeModule
+
+		return control
+	end
+
+	Lib.FindAndRemove = function(t,item)
+		local pos = table.find(t,item)
+		if pos then table.remove(t,pos) end
+	end
+
+	Lib.AttachTo = function(obj,data)
+		local target,posOffX,posOffY,sizeOffX,sizeOffY,resize,con
+		local disabled = false
+
+		local function update()
+			if not obj or not target then return end
+
+			local targetPos = target.AbsolutePosition
+			local targetSize = target.AbsoluteSize
+			obj.Position = UDim2.new(0,targetPos.X + posOffX,0,targetPos.Y + posOffY)
+			if resize then obj.Size = UDim2.new(0,targetSize.X + sizeOffX,0,targetSize.Y + sizeOffY) end
+		end
+
+		local function setup(o,data)
+			obj = o
+			data = data or {}
+			target = data.Target
+			posOffX = data.PosOffX or 0
+			posOffY = data.PosOffY or 0
+			sizeOffX = data.SizeOffX or 0
+			sizeOffY = data.SizeOffY or 0
+			resize = data.Resize or false
+
+			if con then con:Disconnect() con = nil end
+			if target then
+				con = target.Changed:Connect(function(prop)
+					if not disabled and prop == "AbsolutePosition" or prop == "AbsoluteSize" then
+						update()
+					end
+				end)
+			end
+
+			update()
+		end
+		setup(obj,data)
+
+		return {
+			SetData = function(obj,data)
+				setup(obj,data)
+			end,
+			Enable = function()
+				disabled = false
+				update()
+			end,
+			Disable = function()
+				disabled = true
+			end,
+			Destroy = function()
+				con:Disconnect()
+				con = nil
+			end,
+		}
+	end
+
+	Lib.ProtectedGuis = {}
+
+	Lib.ShowGui = Main.SecureGui
+
+	Lib.ColorToBytes = function(col)
+		local round = math.round
+		return string.format("%d, %d, %d",round(col.r*255),round(col.g*255),round(col.b*255))
+	end
+
+	Lib.ReadFile = function(filename)
+		if not env.readfile then return end
+
+		local s,contents = pcall(env.readfile,filename)
+		if
