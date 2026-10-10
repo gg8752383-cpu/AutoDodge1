@@ -1,0 +1,2157 @@
+--!nonstrict
+-- Violence District | AutoDodge ULTRA v9 RESEARCH (best-effort client-side evasion)
+-- PlaceId: 93978595733734
+-- Research basis: public client scripts by nyatoru/NekoHub, DYHUB copies,
+-- amyyzing/Cateyes and other public Violence District scripts.
+--
+-- What this does:
+--   1) Watches killer animation wind-ups/attacks and predicts the hit lane.
+--   2) If the Parrying Dagger/controller is available, attempts a normal in-game parry.
+--   3) Otherwise performs a short, collision/ground-checked sidestep on credible threats.
+--   4) Crouches briefly for the known Abysswalker slash cue (80411309607666).
+--   5) Tracks new fast-moving projectile-like parts and sidesteps only when their
+--      predicted path passes close to the local character.
+--   6) Uses HealthChanged only as a last-resort reaction to a hit that already happened.
+--   7) Includes bounded registries, cached UI lookups, guarded shutdown and respawn-safe binding.
+--
+-- Limits: this cannot grant invulnerability or guarantee evasion from every damage type.
+-- Server-side hit validation, hidden attacks, stale animations, latency, knockdown,
+-- missing items and executor input restrictions can defeat client-side prediction.
+-- No health/i-frame spoofing, damage hooks, arbitrary remote spam, teleport or noclip.
+
+local BUILD_VERSION = "9.0-research"
+local EXPECTED_PLACE_ID = 93978595733734
+if game.PlaceId ~= EXPECTED_PLACE_ID then
+    warn("[VD AutoDodge ULTRA v9 RESEARCH] Wrong place. Expected Violence District (93978595733734).")
+    return
+end
+
+local GENV = (getgenv and getgenv()) or _G
+local function stopExisting(candidate)
+    if type(candidate) == "table" and type(candidate.Stop) == "function" then
+        pcall(candidate.Stop)
+    end
+end
+stopExisting(GENV.VD_AutoDodge_ULTRA)
+stopExisting(GENV.VD_AutoDodge_MAX)
+stopExisting(GENV.VD_ULTRA)
+if type(GENV.VD_ULTRA_Stop) == "function" then
+    pcall(GENV.VD_ULTRA_Stop)
+end
+
+local Players = game:GetService("Players")
+local CollectionService = game:GetService("CollectionService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local GuiService = game:GetService("GuiService")
+local LocalPlayer = Players.LocalPlayer
+
+local State = {
+    Enabled = true,
+    AutoParry = true,
+    ProjectileDodge = true,
+    AbyssCrouch = true,
+    FallbackSidestep = true,
+    EmergencyAfterDamage = true,
+    ParryRange = 10,
+    MeleeRange = 13,
+    ProjectileRange = 160,
+    SidestepSeconds = 0.16,
+    SidestepCooldown = 0.28,
+    ParryCooldown = 0.22,
+    ProjectileScanInterval = 0.045,
+    ProjectileMaxAge = 4.5,
+    MaxTrackedProjectiles = 450,
+    MaxNamedProjectiles = 280,
+    ProjectileThreatRadius = 2.8,
+    ProjectilePredictionHorizon = 0.72,
+    ProjectilePredictionStep = 0.045,
+    ProjectileMinSpeed = 18,
+    ProjectileGravityMultiplier = 0.5, -- public spear visualiser heuristic; not an official game constant
+    AbyssHoldSeconds = 1.0,
+}
+
+local ShuttingDown = false
+local Connections = {}
+local LocalCharacterConnections = {}
+local PlayerConnections = {}
+local AnimatorHooks = {}
+local TrackSeen = setmetatable({}, { __mode = "k" })
+local TrackStoppedHooks = setmetatable({}, { __mode = "k" })
+local YawSamples = setmetatable({}, { __mode = "k" })
+local ProjectileParts = {} -- bounded registry; scan removes expired/detached entries explicitly
+local KillerModelHooks = setmetatable({}, { __mode = "k" })
+local HitboxPartsWatched = setmetatable({}, { __mode = "k" })
+local AttackPartHooks = setmetatable({}, { __mode = "k" })
+local GlobalHitboxHooks = setmetatable({}, { __mode = "k" })
+local ProjectileCount = 0
+local ActiveSidestep = nil
+local LastSidestepAt = -100
+local LastNoSideAt = -100
+local LastParryAt = -100
+local LastParryResultAt = 0
+local LastEmergencyAt = 0
+local LastProjectileDodgeAt = -100
+local LastProjectileDirection = nil
+local CrouchOwned = false
+local CrouchKeyHeld = false
+local CrouchToken = 0
+local GUI = nil
+local UIStatus = nil
+local UIButtons = {}
+local LastStatusMessage = "Starting..."
+local LastStatusAt = 0
+local ParryButtonRef = nil
+local LastParryButtonScan = -100
+local ParryController = nil
+local ParryControllerModule = nil
+local ParryDaggerRef = nil
+local CombatRemoteHooks = setmetatable({}, { __mode = "k" })
+local CrouchController = nil
+local CrouchButtonRef = nil
+local LastControllerScan = -100
+local LastCrouchScan = -100
+
+local function keepConnection(connection)
+    table.insert(Connections, connection)
+    return connection
+end
+
+local function setStatus(message)
+    LastStatusMessage = tostring(message)
+    LastStatusAt = os.clock()
+    if UIStatus then
+        pcall(function() UIStatus.Text = LastStatusMessage end)
+    end
+end
+
+local function disconnectList(list)
+    for _, connection in ipairs(list) do
+        pcall(function() connection:Disconnect() end)
+    end
+    table.clear(list)
+end
+
+local function disconnect(connection)
+    if connection then pcall(function() connection:Disconnect() end) end
+end
+
+-- Track identity alone is not enough: Roblox can replay a cached AnimationTrack
+-- without producing a new object. Detect a TimePosition reset and retire the old watcher.
+local function readTrackPosition(track)
+    local ok, position = pcall(function() return track.TimePosition end)
+    if ok and type(position) == "number" then return math.max(position, 0) end
+    return 0
+end
+
+local function beginTrackPlayback(track)
+    if not track then return nil end
+    local now = os.clock()
+    local position = readTrackPosition(track)
+    local previous = TrackSeen[track]
+    if previous then
+        local restarted = track.IsPlaying and previous.lastPosition ~= nil
+            and position + 0.12 < previous.lastPosition and now - previous.started > 0.12
+        if not restarted then return nil end
+        disconnect(TrackStoppedHooks[track])
+        TrackStoppedHooks[track] = nil
+    end
+
+    local playback = { started = now, lastPosition = position, stopped = false }
+    TrackSeen[track] = playback
+    local stoppedConnection
+    stoppedConnection = track.Stopped:Connect(function()
+        playback.stopped = true
+        if TrackSeen[track] == playback then TrackSeen[track] = nil end
+        if TrackStoppedHooks[track] == stoppedConnection then TrackStoppedHooks[track] = nil end
+        disconnect(stoppedConnection)
+    end)
+    TrackStoppedHooks[track] = stoppedConnection
+    return playback
+end
+
+local function updateTrackPlayback(track, playback, position)
+    if not playback or TrackSeen[track] ~= playback then return false end
+    if type(position) ~= "number" then position = readTrackPosition(track) end
+    playback.lastPosition = math.max(position, 0)
+    return true
+end
+
+local function flat(vector)
+    return Vector3.new(vector.X, 0, vector.Z)
+end
+
+local function safeUnit(vector)
+    if vector.Magnitude < 0.001 then return Vector3.zero end
+    return vector.Unit
+end
+
+local function getCharacter()
+    return LocalPlayer.Character
+end
+
+local function getRoot(character)
+    character = character or getCharacter()
+    return character and character:FindFirstChild("HumanoidRootPart")
+end
+
+local function getHumanoid(character)
+    character = character or getCharacter()
+    return character and character:FindFirstChildOfClass("Humanoid")
+end
+
+local function getTeamName(player)
+    return player and player.Team and player.Team.Name or ""
+end
+
+local function normalizedRole(value)
+    return string.lower(tostring(value or "")):gsub("%s+", "")
+end
+
+local function hasRoleWord(value, word)
+    return normalizedRole(value):find(word, 1, true) ~= nil
+end
+
+local function isTaggedKillerCharacter(character)
+    if not character then return false end
+    local ok, tagged = pcall(function()
+        return CollectionService:HasTag(character, "Killer")
+    end)
+    return ok and tagged == true
+end
+
+local function isSurvivor()
+    local team = getTeamName(LocalPlayer)
+    local role = LocalPlayer:GetAttribute("Role")
+    local character = getCharacter()
+    local characterRole = character and character:GetAttribute("Role")
+    local normTeam, normRole, normCharRole = normalizedRole(team), normalizedRole(role), normalizedRole(characterRole)
+    -- Team names are usually "Survivors"; role attributes/tags vary between client builds.
+    local explicitSurvivor = hasRoleWord(normTeam, "survivor")
+        or hasRoleWord(normRole, "survivor") or hasRoleWord(normCharRole, "survivor")
+    local explicitKiller = hasRoleWord(normTeam, "killer") or hasRoleWord(normRole, "killer")
+        or hasRoleWord(normCharRole, "killer") or isTaggedKillerCharacter(character)
+    return explicitSurvivor and not explicitKiller
+end
+
+local function refreshBaseStatus(force)
+    if not UIStatus then return end
+    if force or os.clock() - LastStatusAt >= 3.0 then
+        local message
+        if not State.Enabled then
+            message = "AUTO DODGE PAUSED"
+        elseif not isSurvivor() then
+            message = "WAITING FOR SURVIVOR ROLE"
+        else
+            message = "SURVIVOR · THREAT WATCH ON"
+        end
+        pcall(function() UIStatus.Text = message end)
+        LastStatusMessage = message
+        LastStatusAt = os.clock()
+    end
+end
+
+
+local function isKillerPlayer(player)
+    if not player or player == LocalPlayer then return false end
+    local team = normalizedRole(getTeamName(player))
+    local role = normalizedRole(player:GetAttribute("Role"))
+    local character = player.Character
+    local characterRole = normalizedRole(character and character:GetAttribute("Role"))
+    local playerKiller = player:GetAttribute("Killer") == true
+    local characterKiller = character ~= nil and character:GetAttribute("Killer") == true
+    return hasRoleWord(team, "killer") or hasRoleWord(role, "killer")
+        or hasRoleWord(characterRole, "killer") or playerKiller or characterKiller
+        or isTaggedKillerCharacter(character)
+end
+
+local function isInWorkspace(instance)
+    return instance ~= nil and instance.Parent ~= nil and instance:IsDescendantOf(Workspace)
+end
+
+local function isCharacterModel(model)
+    if not model or not model:IsA("Model") then return false end
+    return model:FindFirstChildOfClass("Humanoid") ~= nil
+end
+
+local function belongsToCharacter(instance)
+    local current = instance
+    while current and current ~= Workspace do
+        if current:IsA("Model") and isCharacterModel(current) then return true end
+        current = current.Parent
+    end
+    return false
+end
+
+local function characterBlocked(character)
+    if not character then return true end
+    for _, attribute in ipairs({ "Knocked", "Downed", "IsHooked", "IsCarried", "IsStunned", "Immobile", "IsDead" }) do
+        if character:GetAttribute(attribute) == true or LocalPlayer:GetAttribute(attribute) == true then
+            return true
+        end
+    end
+    return false
+end
+
+-- Normal input/interaction should be left alone; parry is skipped while busy, but a credible
+-- threat can still request a short sidestep as a last-resort cancel just as moving manually would.
+local function isBusyAction()
+    local character = getCharacter()
+    local root = getRoot(character)
+    local busyTag = false
+    if character then
+        local ok, tagged = pcall(function()
+            return CollectionService:HasTag(character, "doing action")
+                or (root ~= nil and CollectionService:HasTag(root, "doing action"))
+        end)
+        busyTag = ok and tagged == true
+    end
+    if busyTag then return true end
+
+    local actionAttributes = {
+        "isVaulting", "isRepairing", "isUnhooking", "isHealing", "isSliding",
+        "isDroppingPallet", "isExiting",
+    }
+    local holders = {}
+    if character then table.insert(holders, character) end
+    if root then table.insert(holders, root) end
+    local interactable = character and character:FindFirstChild("CheckInterractable")
+    if interactable then table.insert(holders, interactable) end
+    for _, holder in ipairs(holders) do
+        for _, attribute in ipairs(actionAttributes) do
+            if holder:GetAttribute(attribute) == true then return true end
+        end
+    end
+    return false
+end
+
+local function canAct()
+    if not State.Enabled or ShuttingDown or not isSurvivor() then return false end
+    local character = getCharacter()
+    local humanoid = getHumanoid(character)
+    local root = getRoot(character)
+    if not character or not humanoid or humanoid.Health <= 0 or not root then return false end
+    if characterBlocked(character) then return false end
+    local ragdoll = character:FindFirstChild("RagdollTrigger")
+    if ragdoll and ragdoll:IsA("ValueBase") and ragdoll.Value == true then return false end
+    return true
+end
+
+local function getNetworkLag()
+    local ok, value = pcall(function() return LocalPlayer:GetNetworkPing() end)
+    if ok and type(value) == "number" then return math.clamp(value, 0, 0.2) end
+    return 0.08
+end
+
+local function getParryDagger(character)
+    character = character or getCharacter()
+    if not character then return nil end
+    local direct = character:FindFirstChild("Parrying Dagger")
+    if direct then return direct end
+    for _, child in ipairs(character:GetChildren()) do
+        if child:IsA("Tool") and child.Name == "Parrying Dagger" then return child end
+    end
+    return nil
+end
+
+local function resolveParryController()
+    if not State.AutoParry or not canAct() or isBusyAction() then return nil end
+    local character = getCharacter()
+    local dagger = getParryDagger(character)
+    if not dagger then
+        ParryController, ParryDaggerRef = nil, nil
+        return nil
+    end
+    if ParryController and ParryDaggerRef == dagger
+        and type(ParryController.CanUse) == "function"
+        and type(ParryController.Parry) == "function" then
+        return ParryController
+    end
+    if os.clock() - LastControllerScan < 2 then return nil end
+    LastControllerScan = os.clock()
+    ParryController, ParryDaggerRef = nil, dagger
+
+    local modules = ReplicatedStorage:FindFirstChild("Modules")
+    local items = modules and modules:FindFirstChild("Items")
+    local moduleScript = items and items:FindFirstChild("ParryClient")
+    if moduleScript then
+        local ok, result = pcall(require, moduleScript)
+        if ok then ParryControllerModule = result end
+    end
+
+    if type(getgc) == "function" then
+        local ok, gcObjects = pcall(getgc, true)
+        if ok and type(gcObjects) == "table" then
+            for _, candidate in ipairs(gcObjects) do
+                if type(candidate) == "table"
+                    and type(candidate.CanUse) == "function"
+                    and type(candidate.Parry) == "function"
+                    and rawget(candidate, "parryEvent") ~= nil then
+                    local matches = false
+                    if ParryControllerModule and getmetatable(candidate) == ParryControllerModule then
+                        matches = true
+                    end
+                    local tool = rawget(candidate, "tool")
+                    if tool and typeof(tool) == "Instance" then
+                        if tool == dagger or tool:IsDescendantOf(dagger) then matches = true end
+                    end
+                    if matches then
+                        ParryController = candidate
+                        break
+                    end
+                end
+            end
+        end
+    end
+    return ParryController
+end
+
+local function getParryButton()
+    -- Cached to avoid crawling PlayerGui descendants on every threat tick.
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not playerGui then
+        ParryButtonRef = nil
+        return nil
+    end
+    if ParryButtonRef and ParryButtonRef.Parent and ParryButtonRef.Visible
+        and ParryButtonRef:IsDescendantOf(playerGui) then
+        return ParryButtonRef
+    end
+    if os.clock() - LastParryButtonScan < 1.0 then return nil end
+    LastParryButtonScan = os.clock()
+    ParryButtonRef = nil
+    local mobile = playerGui:FindFirstChild("Survivor-mob")
+    local controls = mobile and mobile:FindFirstChild("Controls")
+    local explicit = controls and controls:FindFirstChild("Gui-mob")
+    if explicit and explicit:IsA("GuiButton") and explicit.Visible then
+        ParryButtonRef = explicit
+        return explicit
+    end
+    for _, object in ipairs(playerGui:GetDescendants()) do
+        if object:IsA("GuiButton") and object.Visible then
+            local name = normalizedRole(object.Name)
+            local label = object:IsA("TextButton") and normalizedRole(object.Text) or ""
+            if name:find("parry", 1, true) or name:find("parryingdagger", 1, true)
+                or label:find("parry", 1, true) then
+                ParryButtonRef = object
+                return object
+            end
+        end
+    end
+    return nil
+end
+
+local function fallbackParryInput()
+    if not State.AutoParry or not getParryDagger() then return false end
+    if UserInputService.TouchEnabled then
+        local button = getParryButton()
+        if not button then return false end
+        if type(firesignal) == "function" then
+            local ok = pcall(function()
+                firesignal(button.MouseButton1Down)
+                task.wait(0.012)
+                firesignal(button.MouseButton1Up)
+            end)
+            if ok then return true end
+        end
+        local ok = pcall(function() button:Activate() end)
+        return ok
+    end
+    local vim = game:GetService("VirtualInputManager")
+    local camera = Workspace.CurrentCamera
+    local size = camera and camera.ViewportSize
+    local x = size and size.X * 0.5 or 0
+    local y = size and size.Y * 0.5 or 0
+    local ok = pcall(function()
+        vim:SendMouseButtonEvent(x, y, 1, true, game, 1)
+        task.wait(0.018)
+        vim:SendMouseButtonEvent(x, y, 1, false, game, 1)
+    end)
+    return ok
+end
+
+local function tryParry(reason)
+    if not canAct() or not State.AutoParry or isBusyAction() then return false end
+    if os.clock() - LastParryAt < State.ParryCooldown then return false end
+    local character = getCharacter()
+    if not character or character:GetAttribute("Parry") == true then return false end
+    local controller = resolveParryController()
+    if controller then
+        local ok, canUse = pcall(function() return controller:CanUse() end)
+        if ok and not canUse then
+            setStatus("PARRY NOT READY")
+            return false -- a valid controller explicitly says cooldown/action checks failed
+        elseif ok and canUse then
+            -- The public game controller's Parry() may yield while its animation plays.
+            -- Never block this threat watcher: dispatch it in its own protected task.
+            LastParryAt = os.clock()
+            task.spawn(function()
+                local parryOK, parryError = pcall(function() controller:Parry() end)
+                if not parryOK and not ShuttingDown then
+                    setStatus("PARRY ERROR · " .. tostring(parryError))
+                    if ParryController == controller then
+                        ParryController, ParryDaggerRef = nil, nil
+                    end
+                end
+            end)
+            setStatus("PARRY SENT · " .. tostring(reason))
+            return true
+        else
+            -- A stale controller can survive a dagger refresh in exploit environments.
+            -- Invalidate it on an exception so the real input fallback can still be tried.
+            ParryController, ParryDaggerRef = nil, nil
+        end
+    end
+    -- Only fall back to an actual UI/mouse input when the game's controller is unavailable or stale.
+    if fallbackParryInput() then
+        LastParryAt = os.clock()
+        setStatus("PARRY INPUT · " .. tostring(reason))
+        return true
+    end
+    return false
+end
+
+local function rayParams(exclude)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = exclude or { getCharacter() }
+    params.IgnoreWater = true
+    return params
+end
+
+local function hasLineOfSight(attackerCharacter, attackerRoot, localRoot)
+    local origin = attackerRoot.Position + Vector3.new(0, 1.5, 0)
+    local target = localRoot.Position + Vector3.new(0, 1, 0)
+    local delta = target - origin
+    if delta.Magnitude < 0.1 then return true end
+    local ok, hit = pcall(function()
+        return Workspace:Raycast(origin, delta, rayParams({ attackerCharacter, getCharacter() }))
+    end)
+    return ok and hit == nil
+end
+
+local function predictedAttackerPose(character, root)
+    local now = os.clock()
+    local look = safeUnit(flat(root.CFrame.LookVector))
+    local previous = YawSamples[character]
+    local yawRate = previous and previous.yawRate or 0
+
+    -- Many animation and hitbox callbacks may ask for the pose in the same frame.
+    -- Sample yaw at most about 40 times/s, rather than deriving a noisy rate from
+    -- near-identical timestamps in competing watcher tasks.
+    if not previous then
+        YawSamples[character] = { look = look, time = now, yawRate = 0 }
+    else
+        local dt = now - previous.time
+        if dt >= 0.025 then
+            local measured = 0
+            if dt < 0.25 and previous.look.Magnitude > 0.1 and look.Magnitude > 0.1 then
+                local cross = previous.look:Cross(look).Y
+                local dot = math.clamp(previous.look:Dot(look), -1, 1)
+                measured = math.clamp(math.atan2(cross, dot) / dt, -12, 12)
+            end
+            yawRate = previous.yawRate * 0.35 + measured * 0.65
+            YawSamples[character] = { look = look, time = now, yawRate = yawRate }
+        end
+    end
+
+    local lag = getNetworkLag()
+    local turn = math.clamp(yawRate * lag, -math.rad(60), math.rad(60))
+    local predictedLook = safeUnit(flat(CFrame.Angles(0, turn, 0):VectorToWorldSpace(look)))
+    local predictedPosition = root.Position + flat(root.AssemblyLinearVelocity) * lag
+    return predictedPosition, predictedLook, lag
+end
+
+-- Checks whether a killer's replicated swing lane or close-facing cone reaches us.
+local function isAimedAtLocal(killerCharacter, range, requireFacing)
+    if not canAct() then return false, math.huge, nil end
+    local myRoot = getRoot()
+    local killerRoot = getRoot(killerCharacter)
+    if not myRoot or not killerRoot then return false, math.huge, nil end
+    if math.abs(myRoot.Position.Y - killerRoot.Position.Y) > 5 then return false, math.huge, nil end
+    if not hasLineOfSight(killerCharacter, killerRoot, myRoot) then return false, math.huge, nil end
+
+    local killerPosition, look, lag = predictedAttackerPose(killerCharacter, killerRoot)
+    -- Compare attacker and survivor at roughly the same network timestamp rather than
+    -- predicting only the attacker's pose while leaving a moving survivor in the past.
+    local myPredictedPosition = myRoot.Position + flat(myRoot.AssemblyLinearVelocity) * lag
+    local toMe = flat(myPredictedPosition - killerPosition)
+    local distance = toMe.Magnitude
+    if distance > range then return false, distance, toMe end
+    if distance < 2.0 then return true, distance, toMe end
+    if look.Magnitude < 0.1 then return not requireFacing, distance, toMe end
+
+    local forward = toMe:Dot(look)
+    local closeDistance = math.min(range, 7)
+    if distance <= closeDistance and forward > distance * math.cos(math.rad(40)) then
+        return true, distance, toMe
+    end
+    local lateralSquared = math.max(distance * distance - forward * forward, 0)
+    local lateral = math.sqrt(lateralSquared)
+    -- Long swings can occupy a narrow corridor; generic cues get a wider front cone,
+    -- but never treat an attacker behind us as automatically aiming at us.
+    if forward > 0 and lateral <= 2.5 then return true, distance, toMe end
+    if not requireFacing and forward > distance * math.cos(math.rad(70)) then
+        return true, distance, toMe
+    end
+    return false, distance, toMe
+end
+
+local function slashTargetsUs(killerCharacter)
+    if not canAct() then return false end
+    local myRoot = getRoot()
+    local killerRoot = getRoot(killerCharacter)
+    if not myRoot or not killerRoot then return false end
+    if math.abs(myRoot.Position.Y - killerRoot.Position.Y) > 5 then return false end
+    local toMe = flat(myRoot.Position - killerRoot.Position)
+    local distance = toMe.Magnitude
+    if distance > 40 then return false end
+    if distance < 2 then return true end
+    if not hasLineOfSight(killerCharacter, killerRoot, myRoot) then return false end
+    local look = safeUnit(flat(killerRoot.CFrame.LookVector))
+    return look.Magnitude > 0.1 and look:Dot(toMe.Unit) >= math.cos(math.rad(45))
+end
+
+local function isCrouching()
+    local character = getCharacter()
+    return character ~= nil and character:GetAttribute("Crouching") == true
+end
+
+local function getCrouchButton()
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local mobile = playerGui and playerGui:FindFirstChild("Survivor-mob")
+    local controls = mobile and mobile:FindFirstChild("Controls")
+    local button = controls and controls:FindFirstChild("crouch")
+    if button and button:IsA("GuiButton") then return button end
+    return nil
+end
+
+local function resolveCrouchController(button)
+    if not button then return nil end
+    if CrouchController and CrouchButtonRef == button and type(CrouchController._setCrouching) == "function" then
+        return CrouchController
+    end
+    if os.clock() - LastCrouchScan < 2 or type(getgc) ~= "function" then return nil end
+    LastCrouchScan = os.clock()
+    CrouchController, CrouchButtonRef = nil, button
+    local ok, gcObjects = pcall(getgc, true)
+    if ok and type(gcObjects) == "table" then
+        for _, candidate in ipairs(gcObjects) do
+            if type(candidate) == "table" and rawget(candidate, "crouchButton") == button
+                and type(candidate._setCrouching) == "function" then
+                CrouchController = candidate
+                break
+            end
+        end
+    end
+    return CrouchController
+end
+
+local function setCrouch(on)
+    if isCrouching() == on then return true end
+    local button = getCrouchButton()
+    if UserInputService.TouchEnabled and button and button.Visible then
+        if isCrouching() ~= on then
+            local fired = false
+            if type(firesignal) == "function" then
+                fired = pcall(firesignal, button.Activated)
+            end
+            if not fired then pcall(function() button:Activate() end) end
+            task.wait(0.10)
+        end
+        local controller = resolveCrouchController(button)
+        if controller and isCrouching() ~= on then
+            pcall(function() controller:_setCrouching(on) end)
+            pcall(function() controller:_refreshMobileButtons() end)
+        end
+        -- Only retry the real mobile toggle if neither the button nor controller changed state.
+        if isCrouching() ~= on and not controller then
+            pcall(function() button:Activate() end)
+        end
+        return isCrouching() == on
+    end
+
+    if LocalPlayer:GetAttribute("crouchtoggle") == true then
+        local ok = pcall(function()
+            local vim = game:GetService("VirtualInputManager")
+            vim:SendKeyEvent(true, Enum.KeyCode.C, false, game)
+            vim:SendKeyEvent(false, Enum.KeyCode.C, false, game)
+        end)
+        if not ok then return false end
+        -- Do not mark crouch as owned unless the game actually reports the requested state.
+        for _ = 1, 6 do
+            if isCrouching() == on then return true end
+            task.wait(0.025)
+        end
+        return isCrouching() == on
+    end
+
+    local ok = pcall(function()
+        local vim = game:GetService("VirtualInputManager")
+        vim:SendKeyEvent(on, Enum.KeyCode.C, false, game)
+    end)
+    if ok then CrouchKeyHeld = on end
+    return ok
+end
+
+local function scheduleAbyssCrouch(killerCharacter, track, playback)
+    if not State.AbyssCrouch or not State.Enabled or not isSurvivor() then return end
+    CrouchToken = CrouchToken + 1
+    local myToken = CrouchToken
+    task.spawn(function()
+        local start = playback and playback.started or os.clock()
+        local own = false
+        while State.Enabled and not ShuttingDown and myToken == CrouchToken
+            and TrackSeen[track] == playback and os.clock() - start < State.AbyssHoldSeconds do
+            local elapsed = math.max(os.clock() - start, readTrackPosition(track))
+            local root, myRoot = getRoot(killerCharacter), getRoot()
+            local distance = (root and myRoot) and flat(myRoot.Position - root.Position).Magnitude or math.huge
+            -- Community code estimates ~0.8 s wind-up. Don't crouch at long range on
+            -- the first replicated frame; allow it when the phase advanced or danger is close.
+            local phaseReady = elapsed >= 0.42 or distance <= 12
+            if phaseReady and not own and not isCrouching() and slashTargetsUs(killerCharacter) then
+                own = setCrouch(true)
+                CrouchOwned = own
+                if own then setStatus("ABYSS SLASH · CROUCH") end
+            elseif not own and CrouchOwned and isCrouching() then
+                own = true
+            end
+            updateTrackPlayback(track, playback, readTrackPosition(track))
+            task.wait()
+        end
+        if myToken == CrouchToken and own and CrouchOwned then
+            setCrouch(false)
+            CrouchOwned = false
+        end
+    end)
+end
+
+local function sideIsSafe(direction, distance)
+    local root = getRoot()
+    if not root or direction.Magnitude < 0.1 then return false end
+    local character = getCharacter()
+    local params = rayParams({ character })
+    local origin = root.Position + Vector3.new(0, 1.5, 0)
+    local wallHit = Workspace:Raycast(origin, direction.Unit * distance, params)
+    if wallHit and wallHit.Distance < distance - 0.8 then return false end
+    local landing = root.Position + direction.Unit * distance + Vector3.new(0, 5, 0)
+    local groundHit = Workspace:Raycast(landing, Vector3.new(0, -14, 0), params)
+    return groundHit ~= nil and groundHit.Normal.Y > 0.35
+end
+
+local function chooseSafeSide(threatDirection, projectile)
+    local root = getRoot()
+    if not root then return nil end
+    local incoming = safeUnit(flat(threatDirection))
+    if incoming.Magnitude < 0.1 then incoming = safeUnit(flat(root.CFrame.LookVector)) end
+    if incoming.Magnitude < 0.1 then incoming = Vector3.new(0, 0, -1) end
+
+    local sideA = safeUnit(Vector3.new(-incoming.Z, 0, incoming.X))
+    local sideB = -sideA
+    -- Lateral options remain first. If both are blocked, diagonals or a short retreat
+    -- can still be viable; never choose a candidate before checking both wall and ground.
+    local candidates
+    if projectile then
+        -- Never deliberately step straight down a projectile's flight line.
+        candidates = { sideA, sideB,
+            safeUnit(sideA + incoming), safeUnit(sideB + incoming),
+            safeUnit(sideA - incoming), safeUnit(sideB - incoming) }
+    else
+        -- For melee, incoming points from the attacker toward the local player, so
+        -- moving farther along it is a useful retreat if the lateral routes are blocked.
+        candidates = { sideA, sideB,
+            safeUnit(sideA + incoming), safeUnit(sideB + incoming), incoming }
+    end
+
+    local dist = 4.5
+    local current = safeUnit(flat((getHumanoid() and getHumanoid().MoveDirection) or Vector3.zero))
+    local perpendicular = sideA
+    local best, bestScore = nil, -math.huge
+    local seen = {}
+    for _, candidate in ipairs(candidates) do
+        if candidate.Magnitude > 0.1 then
+            local key = string.format("%.2f:%.2f", candidate.X, candidate.Z)
+            if not seen[key] then
+                seen[key] = true
+                if sideIsSafe(candidate, dist) then
+                    local score = current.Magnitude > 0 and current:Dot(candidate) * 0.28 or 0
+                    local lateral = math.abs(candidate:Dot(perpendicular))
+                    score = score + lateral * (projectile and 1.2 or 0.55)
+                    if projectile then
+                        score = score - math.max(candidate:Dot(incoming), 0) * 0.30
+                    else
+                        score = score + candidate:Dot(incoming) * 0.22
+                    end
+
+                    local landing = root.Position + candidate * dist
+                    local nearest = math.huge
+                    for _, player in ipairs(Players:GetPlayers()) do
+                        if isKillerPlayer(player) and player.Character then
+                            local killerRoot = getRoot(player.Character)
+                            if killerRoot then
+                                local candidateDistance = flat(landing - killerRoot.Position).Magnitude
+                                if candidateDistance < nearest then nearest = candidateDistance end
+                            end
+                        end
+                    end
+                    if nearest < math.huge then score = score + math.clamp(nearest / 18, 0, 1.5) end
+                    if score > bestScore then best, bestScore = candidate, score end
+                end
+            end
+        end
+    end
+    return best
+end
+
+local function requestSidestep(threatDirection, source, projectile, emergency, timeToImpact)
+    if not State.Enabled or not State.FallbackSidestep or not canAct() then return false end
+    if isBusyAction() and not projectile and not emergency then return false end
+    local now = os.clock()
+    local cooldown = State.SidestepCooldown
+    if projectile and type(timeToImpact) == "number" and timeToImpact <= 0.22 then
+        cooldown = math.min(cooldown, 0.055) -- let an imminent projectile override a recent melee step
+    end
+    if now - LastSidestepAt < cooldown then return false end
+    if projectile and (not State.ProjectileDodge or now - LastProjectileDodgeAt < cooldown) then return false end
+    if now - LastNoSideAt < 0.08 then return false end
+    local side = chooseSafeSide(threatDirection, projectile)
+    if not side then
+        if now - LastNoSideAt >= 0.30 then setStatus("DODGE: BLOCKED / NO SAFE SIDE") end
+        LastNoSideAt = now
+        return false
+    end
+    LastNoSideAt = -100
+    local humanoid = getHumanoid()
+    if not humanoid then return false end
+    local current = safeUnit(flat(humanoid.MoveDirection))
+    local mixed = current.Magnitude > 0.1 and safeUnit(current * 0.48 + side * 0.9) or side
+    ActiveSidestep = { direction = mixed, endAt = now + State.SidestepSeconds }
+    LastSidestepAt = now
+    if projectile then
+        LastProjectileDodgeAt = now
+        LastProjectileDirection = threatDirection
+    end
+    setStatus((projectile and "PROJECTILE DODGE" or "SIDE-STEP") .. " · " .. tostring(source))
+    return true
+end
+
+local function tryDefensiveAction(killerCharacter, source, maxRange)
+    local owner = killerCharacter and Players:GetPlayerFromCharacter(killerCharacter)
+    if not isKillerPlayer(owner) then return false end
+    local aimed, distance, toMe = isAimedAtLocal(killerCharacter, maxRange or State.MeleeRange, false)
+    if not aimed then return false end
+    if distance <= State.ParryRange + 1.0 and tryParry(source) then return true end
+    return requestSidestep(toMe or Vector3.zero, source, false,
+        distance <= State.ParryRange + 1.5)
+end
+
+-- Mapped from the inspected public NekoHub + DYHUB animation tables.
+-- Hold timings are estimates from those scripts, not official game constants.
+local HOLD_META = {
+    ["118907603246885"] = { killer = "Abysswalker", hold = 0.50, speed = 25 },
+    ["110355011987939"] = { killer = "Slasher", hold = 0.60, speed = 27 },
+    ["122812055447896"] = { killer = "Veil", hold = 0.60, speed = 23 },
+    ["129784271201071"] = { killer = "Killer", hold = 0.60, speed = 27 },
+    ["135002183282873"] = { killer = "Cure", hold = 0.60, speed = 27 },
+    ["113255068724446"] = { killer = "Hidden", hold = 0.60, speed = 27 },
+    ["117042998468241"] = { killer = "Stalker", hold = 0.60, speed = 27 },
+    ["105374834496520"] = { killer = "Masked", hold = 0.60, speed = 27, liveSpeed = true },
+    ["98163597193511"] = { killer = "Hidden", hold = 0.55, speed = 90, range = 50, charge = true },
+    ["115244153053858"] = { killer = "Masked", hold = 0.80, speed = 27, charge = true },
+    ["117070354890871"] = { killer = "Masked", hold = 1.70, speed = 27, charge = true },
+    ["106871536134254"] = { killer = "Masked", hold = 3.00, speed = 27, charge = true },
+}
+
+-- All known attack/hold cues found in the inspected public tables. HOLD_META wins first,
+-- so hold IDs use the wind-up estimator and this set remains the late-cue fallback.
+local ATTACK_IDS = {
+    ["78432063483146"] = true, ["77081789642514"] = true,
+    ["139369275981139"] = true, ["110355011987939"] = true,
+    ["78935059863801"] = true, ["132817836308238"] = true,
+    ["129784271201071"] = true, ["82666958311998"] = true,
+    ["121216847022485"] = true, ["74968262036854"] = true,
+    ["133963973694098"] = true, ["111920872708571"] = true,
+    ["130593238885843"] = true, ["138720291317243"] = true,
+    ["117042998468241"] = true, ["122812055447896"] = true,
+    ["135002183282873"] = true, ["118907603246885"] = true,
+    ["113255068724446"] = true, ["98163597193511"] = true,
+    ["105374834496520"] = true, ["106871536134254"] = true,
+    ["115244153053858"] = true, ["117070354890871"] = true,
+    ["80411309607666"] = true,
+}
+
+local PROJECTILE_THROW_ANIMS = {
+    ["93136435416899"] = true, ["86266790353635"] = true,
+    ["124191224140066"] = true, ["136859656743697"] = true,
+}
+
+local ABYSS_SLASH_ID = "80411309607666"
+
+local function processKnownAttack(killerCharacter, track, animationId, meta)
+    local playback = beginTrackPlayback(track)
+    if not playback then return end
+    task.spawn(function()
+        local started = playback.started
+        local maxWatch
+        if meta and meta.range then
+            maxWatch = 2.2 -- public reference watches the Hidden dash through its post-charge travel
+        elseif meta and meta.charge then
+            maxWatch = math.min((meta.hold or 0.6) + 0.60, 3.4)
+        else
+            -- Keep a short post-release watch: the hold track often stops exactly as the
+            -- killer begins the dash, so stopping at Track.IsPlaying=false loses the hit cue.
+            maxWatch = meta and math.min((meta.hold or 0.6) + 0.48, 3.6) or 0.50
+        end
+        local firedDodge = false
+        while State.Enabled and not ShuttingDown
+            and (TrackSeen[track] == playback or (playback.stopped and TrackSeen[track] == nil))
+            and (track.IsPlaying or meta ~= nil)
+            and os.clock() - started <= maxWatch do
+            if not isKillerPlayer(Players:GetPlayerFromCharacter(killerCharacter)) then break end
+            if not canAct() then task.wait(0.03) else
+                local elapsed = os.clock() - started
+                -- AnimationPlayed can arrive one or more replication frames after play began.
+                -- TimePosition lets the wind-up estimate start from the observed animation phase.
+                local okPosition, timePosition = pcall(function() return track.TimePosition end)
+                if okPosition and type(timePosition) == "number" then
+                    elapsed = math.max(elapsed, math.max(timePosition, 0))
+                    updateTrackPlayback(track, playback, timePosition)
+                end
+                local left = meta and math.max((meta.hold or 0.6) - elapsed, 0) or 0
+                local speed = meta and meta.speed or 27
+                if meta and meta.liveSpeed then
+                    local live = tonumber(killerCharacter:GetAttribute("Speed"))
+                    if live and live > 0 then speed = live end
+                end
+                -- During an active dash, observed replicated velocity can be more useful
+                -- than a static community estimate. Ignore absurd/noisy samples.
+                local currentKillerRoot = getRoot(killerCharacter)
+                local observedSpeed = currentKillerRoot and flat(currentKillerRoot.AssemblyLinearVelocity).Magnitude or 0
+                if elapsed >= math.max((meta and meta.hold or 0.6) - 0.05, 0)
+                    and observedSpeed > speed and observedSpeed < 100 then
+                    speed = observedSpeed
+                end
+                local lag = getNetworkLag()
+                local lead = 0.15 + lag
+                -- This is an observation range, not a command-to-parry range. We track
+                -- a plausible lane through remaining hold + a short dash horizon, while
+                -- contactETA below prevents an early parry during a distant wind-up.
+                local observationHorizon = math.clamp(left + 0.42 + lag, 0.42, 1.20)
+                local maximumReach = (meta and meta.range) or (State.MeleeRange + 22)
+                local predictedRange = math.min(State.ParryRange + speed * observationHorizon, maximumReach)
+
+                local actualAimed, distance, toMe = isAimedAtLocal(killerCharacter,
+                    (meta and meta.range) and math.min(predictedRange, meta.range) or predictedRange, false)
+
+                if meta then
+                    -- Long dash-charge attacks are handled near release, not at the start of the charge.
+                    if meta.range then
+                        local ahead = elapsed - (meta.hold or 0.55) + lead
+                        local projected = math.min(State.ParryRange + speed * ahead, meta.range)
+                        local dashAimed, dashDistance, dashToMe = isAimedAtLocal(killerCharacter, projected, false)
+                        if ahead >= 0 and dashAimed then
+                            if tryParry(meta.killer or "dash charge") then return end
+                            if not firedDodge then
+                                firedDodge = requestSidestep(dashToMe or toMe or Vector3.zero,
+                                    meta.killer or "dash charge", false, true)
+                                if firedDodge then return end
+                            end
+                        elseif dashAimed and dashDistance <= 6 and not firedDodge and left <= 0.22 then
+                            firedDodge = requestSidestep(dashToMe or toMe or Vector3.zero,
+                                meta.killer or "close dash", false, true)
+                            if firedDodge then return end
+                        end
+                    else
+                        -- Estimate contact after wind-up plus remaining travel. The old version
+                        -- treated almost every wind-up as urgent and often parried far too early.
+                        local reactionWindow = math.clamp(0.20 + lag, 0.20, 0.36)
+                        local myRootNow = getRoot()
+                        local awayDirection = safeUnit(flat(toMe or Vector3.zero))
+                        local survivorAwaySpeed = myRootNow and flat(myRootNow.AssemblyLinearVelocity):Dot(awayDirection) or 0
+                        -- A survivor already sprinting away buys time; running toward the killer
+                        -- shortens the contact estimate. The dash speed remains capped to avoid
+                        -- a single noisy velocity sample making the script overreact.
+                        local effectiveClosingSpeed = math.clamp(speed - survivorAwaySpeed, 8, 120)
+                        local travelAfterRelease = math.max(distance - State.ParryRange, 0) / effectiveClosingSpeed
+                        local contactETA = left + travelAfterRelease
+                        if actualAimed and contactETA <= reactionWindow then
+                            if tryParry(meta.killer or "killer swing") then return end
+                            if not firedDodge then
+                                firedDodge = requestSidestep(toMe or Vector3.zero,
+                                    meta.killer or "killer swing", false, true)
+                                if firedDodge then return end
+                            end
+                        elseif actualAimed and distance <= 6 and left <= 0.12 and not firedDodge then
+                            firedDodge = requestSidestep(toMe or Vector3.zero,
+                                meta.killer or "close swing", false, true)
+                            if firedDodge then return end
+                        end
+                    end
+                elseif ATTACK_IDS[animationId] then
+                    if actualAimed and distance <= State.MeleeRange then
+                        -- Attack-animation cues are often late. Save the dagger for close
+                        -- threats; use the lateral move if we're still outside parry reach.
+                        if distance <= State.ParryRange + 1.0 and tryParry("attack animation") then return end
+                        if requestSidestep(toMe or Vector3.zero, "attack animation", false,
+                            distance <= State.ParryRange + 1.5) then return end
+                    end
+                end
+                task.wait()
+            end
+        end
+
+        -- A replayed AnimationTrack owns its new watcher; the previous watcher must not
+        -- fire a stale late-fallback against that newer playback.
+        if TrackSeen[track] ~= playback and (not playback.stopped or TrackSeen[track] ~= nil) then return end
+        -- A known attack animation can arrive after the hit starts; keep a short late fallback.
+        local watchElapsed = os.clock() - started
+        if State.Enabled and not ShuttingDown and canAct() and ATTACK_IDS[animationId]
+            and watchElapsed <= 0.65 then
+            tryDefensiveAction(killerCharacter, "late attack cue", State.MeleeRange)
+        end
+    end)
+end
+
+local function processUnknownAction(killerCharacter, track, animationId)
+    local playback = beginTrackPlayback(track)
+    if not playback then return end
+    task.spawn(function()
+        local started = playback.started
+        while State.Enabled and not ShuttingDown and TrackSeen[track] == playback
+            and isKillerPlayer(Players:GetPlayerFromCharacter(killerCharacter))
+            and track.IsPlaying and os.clock() - started < 0.30 do
+            if canAct() then
+                local aimed, distance, toMe = isAimedAtLocal(killerCharacter, State.MeleeRange, false)
+                if aimed and distance <= State.MeleeRange then
+                    if distance <= State.ParryRange + 1.0 and tryParry("unknown action") then return end
+                    if requestSidestep(toMe or Vector3.zero, "unknown action", false,
+                        distance <= State.ParryRange + 1.5) then return end
+                end
+            end
+            updateTrackPlayback(track, playback)
+            task.wait()
+        end
+    end)
+end
+
+local function onKillerAnimation(killerCharacter, track)
+    if not State.Enabled or ShuttingDown or not isSurvivor() then return end
+    local animation = track and track.Animation
+    local animationId = animation and tostring(animation.AnimationId):match("%d+")
+    if not animationId then return end
+
+    if animationId == ABYSS_SLASH_ID then
+        local playback = beginTrackPlayback(track)
+        if not playback then return end
+        scheduleAbyssCrouch(killerCharacter, track, playback)
+        -- The slash dash can still hit while moving quickly, so try normal evasion too.
+        task.spawn(function()
+            local start = playback.started
+            while State.Enabled and not ShuttingDown and TrackSeen[track] == playback
+                and isKillerPlayer(Players:GetPlayerFromCharacter(killerCharacter))
+                and track.IsPlaying and os.clock() - start < 0.95 do
+                local root = getRoot(killerCharacter)
+                local mine = getRoot()
+                if root and mine and slashTargetsUs(killerCharacter) then
+                    local distance = flat(mine.Position - root.Position).Magnitude
+                    local elapsed = os.clock() - start
+                    local okPosition, timePosition = pcall(function() return track.TimePosition end)
+                    if okPosition and type(timePosition) == "number" then
+                        elapsed = math.max(elapsed, math.max(timePosition, 0))
+                        updateTrackPlayback(track, playback, timePosition)
+                    end
+                    -- Community source estimates ~0.8s wind-up and ~28 studs of dash.
+                    -- Avoid spending a side-step immediately at 35-40 studs on the wind-up.
+                    if elapsed >= 0.42 or distance <= 17 then
+                        if requestSidestep(flat(mine.Position - root.Position), "Abysswalker slash", false, true) then
+                            break
+                        end
+                    end
+                end
+                task.wait()
+            end
+        end)
+        return
+    end
+
+    if PROJECTILE_THROW_ANIMS[animationId] then
+        local playback = beginTrackPlayback(track)
+        if not playback then return end
+        task.spawn(function()
+            local start = playback.started
+            while State.Enabled and not ShuttingDown and TrackSeen[track] == playback
+                and isKillerPlayer(Players:GetPlayerFromCharacter(killerCharacter))
+                and track.IsPlaying and os.clock() - start < 0.35 do
+                local kr = getRoot(killerCharacter)
+                local mr = getRoot()
+                local aimed, distance, toMe = isAimedAtLocal(killerCharacter, State.ProjectileRange, false)
+                if kr and mr and aimed and distance <= 65 then
+                    if requestSidestep(toMe or flat(mr.Position - kr.Position),
+                        "projectile release", true, false, math.clamp(distance / 150, 0, 1)) then
+                        return
+                    end
+                end
+                updateTrackPlayback(track, playback)
+                task.wait()
+            end
+        end)
+        return
+    end
+
+    local meta = HOLD_META[animationId]
+    if meta or ATTACK_IDS[animationId] then
+        processKnownAttack(killerCharacter, track, animationId, meta)
+        return
+    end
+
+    -- Broad fallback: unfamiliar Action tracks close to the survivor, not every idle animation.
+    if track.Priority == Enum.AnimationPriority.Action or track.Priority == Enum.AnimationPriority.Action2
+        or track.Priority == Enum.AnimationPriority.Action3 or track.Priority == Enum.AnimationPriority.Action4 then
+        local root = getRoot(killerCharacter)
+        local myRoot = getRoot()
+        if root and myRoot and (flat(myRoot.Position - root.Position)).Magnitude <= State.MeleeRange then
+            processUnknownAction(killerCharacter, track, animationId)
+        end
+    end
+end
+
+local registerProjectilePart -- forward declaration: a weapon part can detach from a character into the world
+
+local HITBOX_NAME_KEYS = {
+    "wallhitboxcollider", "hitboxcollider", "attackhitbox", "weaponhitbox",
+    "swinghitbox", "strikebox", "meleerange",
+}
+
+local PROJECTILE_NAME_KEYS = {
+    "projectile", "spear", "bullet", "knife", "orb", "shot", "water", "fireball", "shard", "missile",
+}
+
+local function looksLikeProjectileName(name)
+    local lower = string.lower(name or "")
+    for _, key in ipairs(PROJECTILE_NAME_KEYS) do
+        if lower:find(key, 1, true) then return true end
+    end
+    return false
+end
+
+local function hasProjectileNamedAncestor(instance)
+    local current = instance
+    local steps = 0
+    while current and current ~= Workspace and steps < 6 do
+        if looksLikeProjectileName(current.Name) then return true end
+        current = current.Parent
+        steps = steps + 1
+    end
+    return false
+end
+
+local OWNER_ATTRIBUTE_KEYS = {
+    "OwnerUserId", "ownerUserId", "UserId", "userId", "Owner", "owner",
+    "Creator", "creator", "PlayerName", "playerName",
+}
+
+local function valueIdentifiesLocalPlayer(value)
+    if value == LocalPlayer or value == getCharacter() then return true end
+    if type(value) == "number" then return value == LocalPlayer.UserId end
+    if type(value) == "string" then
+        local normalized = normalizedRole(value)
+        return normalized == normalizedRole(LocalPlayer.Name)
+            or normalized == normalizedRole(LocalPlayer.DisplayName)
+            or tonumber(value) == LocalPlayer.UserId
+    end
+    return false
+end
+
+local function hasLocalOwnerMarker(instance)
+    local current = instance
+    local steps = 0
+    while current and current ~= Workspace and steps < 7 do
+        for _, key in ipairs(OWNER_ATTRIBUTE_KEYS) do
+            local value = current:GetAttribute(key)
+            if value ~= nil and valueIdentifiesLocalPlayer(value) then return true end
+        end
+        for _, key in ipairs({ "Owner", "Creator", "Player" }) do
+            local marker = current:FindFirstChild(key)
+            if marker and marker:IsA("ObjectValue") and valueIdentifiesLocalPlayer(marker.Value) then
+                return true
+            elseif marker and (marker:IsA("IntValue") or marker:IsA("NumberValue") or marker:IsA("StringValue"))
+                and valueIdentifiesLocalPlayer(marker.Value) then
+                return true
+            end
+        end
+        current = current.Parent
+        steps = steps + 1
+    end
+    return false
+end
+
+local function playerFromOwnerValue(value)
+    if typeof(value) == "Instance" then
+        if value:IsA("Player") then return value end
+        if value:IsA("Model") then return Players:GetPlayerFromCharacter(value) end
+    elseif type(value) == "number" then
+        return Players:GetPlayerByUserId(value)
+    elseif type(value) == "string" then
+        local normalized = normalizedRole(value)
+        local numericId = tonumber(value)
+        if numericId then
+            local byId = Players:GetPlayerByUserId(numericId)
+            if byId then return byId end
+        end
+        for _, player in ipairs(Players:GetPlayers()) do
+            if normalized == normalizedRole(player.Name)
+                or normalized == normalizedRole(player.DisplayName) then
+                return player
+            end
+        end
+    end
+    return nil
+end
+
+local function findMarkedOwner(instance)
+    local current = instance
+    local steps = 0
+    while current and current ~= Workspace and steps < 7 do
+        for _, key in ipairs(OWNER_ATTRIBUTE_KEYS) do
+            local value = current:GetAttribute(key)
+            if value ~= nil then
+                local player = playerFromOwnerValue(value)
+                if player then return player end
+            end
+        end
+        for _, key in ipairs({ "Owner", "Creator", "Player" }) do
+            local marker = current:FindFirstChild(key)
+            if marker then
+                local player
+                if marker:IsA("ObjectValue") then
+                    player = playerFromOwnerValue(marker.Value)
+                elseif marker:IsA("IntValue") or marker:IsA("NumberValue") or marker:IsA("StringValue") then
+                    player = playerFromOwnerValue(marker.Value)
+                end
+                if player then return player end
+            end
+        end
+        current = current.Parent
+        steps = steps + 1
+    end
+    return nil
+end
+
+local function projectileContainer(instance)
+    local current = instance
+    local steps = 0
+    while current and current ~= Workspace and steps < 7 do
+        if looksLikeProjectileName(current.Name) then return current end
+        current = current.Parent
+        steps = steps + 1
+    end
+    return instance
+end
+
+-- Ray-check the predicted flight path against collidable world geometry. Without this,
+-- a spear behind a wall can look like a perfect intercept in pure kinematics.
+local function predictedProjectilePathClear(part, entry, startPosition, velocity, acceleration, duration)
+    if duration <= 0.04 then return true end
+    local myRoot = getRoot()
+    if not myRoot then return false end
+    if (startPosition - myRoot.Position).Magnitude <= State.ProjectileThreatRadius then return true end
+
+    local exclude = { getCharacter(), projectileContainer(part) }
+    local owner = entry.ownerUserId and Players:GetPlayerByUserId(entry.ownerUserId) or nil
+    if owner and owner.Character then table.insert(exclude, owner.Character) end
+    local params = rayParams(exclude)
+    pcall(function() params.RespectCanCollide = true end)
+
+    local segments = acceleration.Magnitude > 0.01 and math.clamp(math.ceil(duration / 0.07), 2, 8) or 1
+    local previousPoint = startPosition
+    for index = 1, segments do
+        local t = duration * index / segments
+        local point = startPosition + velocity * t + acceleration * (0.5 * t * t)
+        local delta = point - previousPoint
+        if delta.Magnitude > 0.05 then
+            local ok, hit = pcall(function() return Workspace:Raycast(previousPoint, delta, params) end)
+            if ok and hit and hit.Distance < delta.Magnitude - 0.35 then
+                return false
+            end
+        end
+        previousPoint = point
+    end
+    return true
+end
+
+local function isAttackHitboxName(name)
+    local lower = string.lower(name or "")
+    for _, key in ipairs(HITBOX_NAME_KEYS) do
+        if lower:find(key, 1, true) then return true end
+    end
+    return false
+end
+
+local function reactToAttackHitbox(killerCharacter, part, source)
+    if not State.Enabled or not isSurvivor() or not part or not part.Parent then return end
+    if not part:IsA("BasePart") or not canAct() then return end
+    local myRoot = getRoot()
+    if not myRoot then return end
+    local distance = (part.Position - myRoot.Position).Magnitude
+    if distance > 16 then return end
+    local aimed, attackerDistance, toMe = isAimedAtLocal(killerCharacter, 16, false)
+    if not aimed and distance > 5 then return end
+    -- A spawned/expanding hitbox may be visible before it reaches us; don't burn a parry
+    -- just because the attacker is inside the broader observation radius.
+    if attackerDistance <= State.ParryRange + 1.0 and tryParry(source) then return end
+    requestSidestep(flat(part.Position - myRoot.Position), source, false,
+        distance <= 5 or (aimed and attackerDistance <= State.ParryRange + 1.5))
+end
+
+local function watchAttackHitbox(killerCharacter, part, _localConnections)
+    if not part:IsA("BasePart") or not isAttackHitboxName(part.Name) or AttackPartHooks[part] then return end
+    HitboxPartsWatched[part] = true
+    local partConnections = {}
+    AttackPartHooks[part] = partConnections
+    local function respond(reason)
+        if not State.Enabled or not isSurvivor() or not isInWorkspace(part) then return end
+        local root = getRoot()
+        if root and (part.Position - root.Position).Magnitude <= 18 then
+            reactToAttackHitbox(killerCharacter, part, reason .. ": " .. part.Name)
+        end
+    end
+    respond("hitbox spawn")
+    table.insert(partConnections, part:GetPropertyChangedSignal("Size"):Connect(function()
+        respond("hitbox resize")
+    end))
+    local lastMoveCheck = -math.huge
+    table.insert(partConnections, part:GetPropertyChangedSignal("CFrame"):Connect(function()
+        -- A replicated hitbox can move every frame; rate-limit raycasts and threat checks.
+        local now = os.clock()
+        if now - lastMoveCheck < 0.065 then return end
+        lastMoveCheck = now
+        respond("hitbox move")
+    end))
+    for _, property in ipairs({ "CanCollide", "CanTouch", "CanQuery", "Transparency" }) do
+        local ok, signal = pcall(function() return part:GetPropertyChangedSignal(property) end)
+        if ok and signal then
+            table.insert(partConnections, signal:Connect(function() respond("hitbox activation") end))
+        end
+    end
+    table.insert(partConnections, part.AncestryChanged:Connect(function(_, parent)
+        if parent then return end
+        disconnectList(partConnections)
+        AttackPartHooks[part] = nil
+        HitboxPartsWatched[part] = nil
+    end))
+end
+
+local function attachKillerModelSensors(character)
+    if KillerModelHooks[character] then return end
+    local localConnections = {}
+    KillerModelHooks[character] = localConnections
+    for _, descendant in ipairs(character:GetDescendants()) do
+        watchAttackHitbox(character, descendant, localConnections)
+    end
+    table.insert(localConnections, character.DescendantAdded:Connect(function(descendant)
+        watchAttackHitbox(character, descendant, localConnections)
+    end))
+    table.insert(localConnections, character.DescendantRemoving:Connect(function(descendant)
+        -- If a whole weapon/model subtree leaves, release its per-part signal hooks too.
+        for part, partConnections in pairs(AttackPartHooks) do
+            local insideRemovedSubtree = part == descendant
+            if not insideRemovedSubtree then
+                local ok, inside = pcall(function() return part:IsDescendantOf(descendant) end)
+                insideRemovedSubtree = ok and inside
+            end
+            if insideRemovedSubtree then
+                disconnectList(partConnections)
+                AttackPartHooks[part] = nil
+                HitboxPartsWatched[part] = nil
+            end
+        end
+        if descendant:IsA("BasePart") then
+            -- A throwable can originate as a weapon child; once detached, reconsider it as a projectile.
+            if hasProjectileNamedAncestor(descendant) then
+                task.defer(function()
+                    if not ShuttingDown and isInWorkspace(descendant) and not belongsToCharacter(descendant) then
+                        registerProjectilePart(descendant)
+                    end
+                end)
+            end
+        end
+    end))
+    table.insert(localConnections, character.AncestryChanged:Connect(function(_, parent)
+        if parent then return end
+        for part, partConnections in pairs(AttackPartHooks) do
+            if not part.Parent or part:IsDescendantOf(character) then
+                disconnectList(partConnections)
+                AttackPartHooks[part] = nil
+                HitboxPartsWatched[part] = nil
+            end
+        end
+        disconnectList(localConnections)
+        KillerModelHooks[character] = nil
+    end))
+end
+
+local function hookKillerCharacter(player)
+    if not isKillerPlayer(player) then return end
+    local character = player.Character
+    if not character then return end
+    attachKillerModelSensors(character)
+    local humanoid = getHumanoid(character)
+    if not humanoid then return end
+    local animator = humanoid:FindFirstChildOfClass("Animator")
+    if not animator then
+        task.spawn(function()
+            animator = humanoid:WaitForChild("Animator", 3)
+            if animator and not ShuttingDown and player.Character == character and isKillerPlayer(player) then
+                hookKillerCharacter(player)
+            end
+        end)
+        return
+    end
+    local old = AnimatorHooks[animator]
+    if old and old.character == character and old.connection.Connected then return end
+    if old then disconnect(old.connection) end
+    local connection = animator.AnimationPlayed:Connect(function(track)
+        if player.Character == character and isKillerPlayer(player) then
+            onKillerAnimation(character, track)
+        end
+    end)
+    -- AnimatorHooks owns this connection; do not append disconnected respawn hooks
+    -- to the global connection array, which otherwise grows for the whole session.
+    AnimatorHooks[animator] = { connection = connection, character = character, player = player }
+end
+
+local function removePlayerWatch(player)
+    local list = PlayerConnections[player]
+    if list then disconnectList(list) PlayerConnections[player] = nil end
+end
+
+local function watchPlayer(player)
+    removePlayerWatch(player)
+    local list = {}
+    PlayerConnections[player] = list
+    local function connect(connection) table.insert(list, connection) end
+    connect(player.CharacterAdded:Connect(function()
+        task.delay(0.18, function()
+            if not ShuttingDown then hookKillerCharacter(player) end
+        end)
+    end))
+    connect(player:GetPropertyChangedSignal("Team"):Connect(function()
+        task.defer(function()
+            if isKillerPlayer(player) then hookKillerCharacter(player) end
+        end)
+    end))
+    connect(player:GetAttributeChangedSignal("Role"):Connect(function()
+        if isKillerPlayer(player) then task.defer(function() hookKillerCharacter(player) end) end
+    end))
+    if player.Character then hookKillerCharacter(player) end
+end
+
+local function nearestKiller()
+    local myRoot = getRoot()
+    if not myRoot then return nil, math.huge end
+    local nearest, best = nil, math.huge
+    for _, player in ipairs(Players:GetPlayers()) do
+        if isKillerPlayer(player) and player.Character then
+            local root = getRoot(player.Character)
+            if root then
+                local distance = (flat(root.Position - myRoot.Position)).Magnitude
+                if distance < best then nearest, best = player.Character, distance end
+            end
+        end
+    end
+    return nearest, best
+end
+
+local function resolveKillerForHitbox(part)
+    local current = part.Parent
+    local steps = 0
+    while current and current ~= Workspace and steps < 8 do
+        if current:IsA("Model") and isCharacterModel(current) then
+            local owner = Players:GetPlayerFromCharacter(current)
+            if owner and isKillerPlayer(owner) then return current end
+            -- Do not misclassify a survivor-owned combat/effect part as a killer hitbox.
+            return nil
+        end
+        current = current.Parent
+        steps = steps + 1
+    end
+
+    -- Some games parent melee hitboxes to a shared Workspace folder instead of a character.
+    local nearest, best = nil, 24
+    for _, player in ipairs(Players:GetPlayers()) do
+        if isKillerPlayer(player) and player.Character then
+            local root = getRoot(player.Character)
+            if root then
+                local distance = (root.Position - part.Position).Magnitude
+                if distance < best then nearest, best = player.Character, distance end
+            end
+        end
+    end
+    return nearest
+end
+
+local function watchGlobalAttackHitbox(part)
+    if not part:IsA("BasePart") or not isAttackHitboxName(part.Name)
+        or HitboxPartsWatched[part] or belongsToCharacter(part) then
+        return
+    end
+    HitboxPartsWatched[part] = true
+    local connections = {}
+    GlobalHitboxHooks[part] = connections
+    local lastCheck = -math.huge
+
+    local function respond(source)
+        local now = os.clock()
+        if now - lastCheck < 0.065 then return end
+        lastCheck = now
+        if not State.Enabled or not isSurvivor() or not isInWorkspace(part) then return end
+        local localRoot = getRoot()
+        if not localRoot or (part.Position - localRoot.Position).Magnitude > 18 then return end
+        local killer = resolveKillerForHitbox(part)
+        if killer then reactToAttackHitbox(killer, part, source .. ": " .. part.Name) end
+    end
+
+    respond("global hitbox spawn")
+    table.insert(connections, part:GetPropertyChangedSignal("Size"):Connect(function()
+        respond("global hitbox resize")
+    end))
+    table.insert(connections, part:GetPropertyChangedSignal("CFrame"):Connect(function()
+        respond("global hitbox move")
+    end))
+    for _, property in ipairs({ "CanCollide", "CanTouch", "CanQuery", "Transparency" }) do
+        local ok, signal = pcall(function() return part:GetPropertyChangedSignal(property) end)
+        if ok and signal then
+            table.insert(connections, signal:Connect(function() respond("global hitbox activation") end))
+        end
+    end
+    table.insert(connections, part.AncestryChanged:Connect(function(_, parent)
+        if parent then return end
+        disconnectList(connections)
+        GlobalHitboxHooks[part] = nil
+        HitboxPartsWatched[part] = nil
+    end))
+end
+
+-- Last-ditch event cues. Damageviz may be emitted at/after a hit, so it is not treated
+-- as reliable pre-hit warning; it only helps react to follow-up attacks.
+local function attachCombatRemotes()
+    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    if not remotes then return end
+    local killers = remotes:FindFirstChild("Killers")
+    if killers then
+        for _, name in ipairs({ "Damageviz", "SlowAttack" }) do
+            local event = killers:FindFirstChild(name)
+            if event and event:IsA("RemoteEvent") and not CombatRemoteHooks[event] then
+                CombatRemoteHooks[event] = true
+                keepConnection(event.OnClientEvent:Connect(function()
+                    if not State.Enabled or not isSurvivor() then return end
+                    local killer, distance = nearestKiller()
+                    if killer and distance <= State.MeleeRange then
+                        -- Damageviz/SlowAttack can be late or cosmetic. Only react if the
+                        -- nearest killer is actually facing into a plausible attack lane.
+                        local aimed, aimedDistance, toMe = isAimedAtLocal(killer, State.MeleeRange, false)
+                        if aimed and aimedDistance <= State.MeleeRange then
+                            if aimedDistance <= State.ParryRange + 1 and not tryParry(name .. " event") then
+                                requestSidestep(toMe or Vector3.zero, name .. " event", false, true)
+                            elseif aimedDistance > State.ParryRange + 1 then
+                                requestSidestep(toMe or Vector3.zero, name .. " event", false, true)
+                            end
+                        end
+                    end
+                end))
+            end
+        end
+    end
+
+    local items = remotes:FindFirstChild("Items")
+    local dagger = items and items:FindFirstChild("Parrying Dagger")
+    local parryResult = dagger and dagger:FindFirstChild("parryResult")
+    if parryResult and parryResult:IsA("RemoteEvent") and not CombatRemoteHooks[parryResult] then
+        CombatRemoteHooks[parryResult] = true
+        keepConnection(parryResult.OnClientEvent:Connect(function(success, _cooldown)
+            LastParryResultAt = os.clock()
+            if success == true then
+                setStatus("PARRY CONFIRMED")
+            else
+                setStatus("PARRY REJECTED / COOLDOWN")
+            end
+            -- The event's second argument isn't assumed to be seconds: public sources
+            -- disagree on units. Keep the local guard conservative and avoid guessing.
+            -- Re-anchor the short local anti-repeat guard to the actual server response.
+            -- The cd argument is deliberately logged only indirectly because public copies
+            -- disagree about whether it is seconds, frames, or a code.
+            LastParryAt = os.clock()
+        end))
+    end
+end
+
+local function removeProjectileEntry(part)
+    if ProjectileParts[part] then
+        ProjectileParts[part] = nil
+        ProjectileCount = math.max(0, ProjectileCount - 1)
+    end
+end
+
+local function evictOldestProjectile(preferUnnamed, onlyNamed)
+    local candidate, oldest = nil, math.huge
+    for part, entry in pairs(ProjectileParts) do
+        local classAllowed = not onlyNamed or entry.named
+        local priorityAllowed = not preferUnnamed or not entry.named
+        if classAllowed and priorityAllowed and entry.born < oldest then
+            candidate, oldest = part, entry.born
+        end
+    end
+    if not candidate and not onlyNamed then
+        for part, entry in pairs(ProjectileParts) do
+            if entry.born < oldest then candidate, oldest = part, entry.born end
+        end
+    end
+    if candidate then removeProjectileEntry(candidate) end
+end
+
+registerProjectilePart = function(instance)
+    if not State.ProjectileDodge or not instance or not instance:IsA("BasePart") then return end
+    if ProjectileParts[instance] or belongsToCharacter(instance) then return end
+    local size = instance.Size
+    local projectileNamed = hasProjectileNamedAncestor(instance)
+    if math.max(size.X, size.Y, size.Z) > (projectileNamed and 12 or 5) then return end
+    -- Do not fill the registry with every loose prop/particle. Keep named projectile
+    -- objects, or small unanchored visible non-collidable parts; speed is checked later,
+    -- after physics has had time to start moving the part.
+    if instance.Anchored and not projectileNamed then return end
+    if not projectileNamed and (instance.CanCollide or instance.Transparency >= 0.98) then return end
+    if hasLocalOwnerMarker(instance) then return end
+    local markedOwner = findMarkedOwner(instance)
+    if markedOwner and markedOwner ~= LocalPlayer and not isKillerPlayer(markedOwner) then
+        return -- don't dodge projectiles whose owner is positively identified as a survivor
+    end
+
+    local namedCount = 0
+    if projectileNamed then
+        for _, entry in pairs(ProjectileParts) do
+            if entry.named then namedCount = namedCount + 1 end
+        end
+        local guard = 0
+        while namedCount >= State.MaxNamedProjectiles and guard < State.MaxNamedProjectiles + 1 do
+            local before = ProjectileCount
+            evictOldestProjectile(false, true)
+            if ProjectileCount >= before then break end
+            namedCount = 0
+            for _, entry in pairs(ProjectileParts) do
+                if entry.named then namedCount = namedCount + 1 end
+            end
+            guard = guard + 1
+        end
+        if namedCount >= State.MaxNamedProjectiles then return end
+    end
+    local guard = 0
+    while ProjectileCount >= State.MaxTrackedProjectiles and guard < State.MaxTrackedProjectiles + 1 do
+        local before = ProjectileCount
+        evictOldestProjectile(true) -- prefer evicting generic entries
+        if ProjectileCount >= before then
+            evictOldestProjectile(false) -- hard fallback prevents a no-progress loop
+        end
+        if ProjectileCount >= before then return end
+        guard = guard + 1
+    end
+    if ProjectileCount >= State.MaxTrackedProjectiles then return end
+
+    local now = os.clock()
+    ProjectileParts[instance] = {
+        position = instance.Position,
+        time = now,
+        born = now,
+        named = projectileNamed,
+        ownerCheckDone = false,
+        ownerUserId = markedOwner and markedOwner.UserId or nil,
+    }
+    ProjectileCount = ProjectileCount + 1
+end
+
+local function scanProjectiles()
+    if not State.Enabled or not State.ProjectileDodge or not canAct() then return end
+    local now = os.clock()
+    local myRoot = getRoot()
+    if not myRoot then return end
+    local function inspect(part, entry)
+        if not part.Parent or not isInWorkspace(part) or belongsToCharacter(part)
+            or now - entry.born > State.ProjectileMaxAge then
+            removeProjectileEntry(part)
+            return false
+        end
+        -- One delayed owner check catches metadata replicated just after spawn without
+        -- re-walking every tracked object through all ancestors on every scan cycle.
+        if not entry.ownerCheckDone and now - entry.born >= 0.25 then
+            entry.ownerCheckDone = true
+            if hasLocalOwnerMarker(part) then
+                removeProjectileEntry(part)
+                return false
+            end
+            local delayedOwner = findMarkedOwner(part)
+            if delayedOwner and delayedOwner ~= LocalPlayer and not isKillerPlayer(delayedOwner) then
+                removeProjectileEntry(part)
+                return false
+            end
+            if delayedOwner then entry.ownerUserId = delayedOwner.UserId end
+        end
+        local pos = part.Position
+        local dt = now - entry.time
+        local estimated = dt > 0.005 and (pos - entry.position) / dt or Vector3.zero
+        local physicsVelocity = part.AssemblyLinearVelocity
+        local velocity = physicsVelocity.Magnitude >= 8 and physicsVelocity or estimated
+        entry.position, entry.time = pos, now
+        local relativePosition = pos - myRoot.Position
+        local distance = relativePosition.Magnitude
+        local speed = velocity.Magnitude
+        if distance <= State.ProjectileRange and distance > 1.5
+            and speed >= State.ProjectileMinSpeed and speed <= 1000 then
+            -- Predict the future 3D path: analytic relative-motion interception for nearly
+            -- linear shots, sampled trajectory for arcs. Public spear-visualiser code uses a
+            -- 0.5 gravity multiplier; apply it only to
+            -- named spear/water-like objects and treat it as an adjustable heuristic.
+            local gravityMultiplier = 0
+            local namedProjectile = hasProjectileNamedAncestor(part)
+            local currentNameNode, kindSteps, knownArcKind = part, 0, false
+            while currentNameNode and currentNameNode ~= Workspace and kindSteps < 6 do
+                local partName = string.lower(currentNameNode.Name or "")
+                if partName:find("spear", 1, true) or partName:find("water", 1, true)
+                    or partName:find("holy", 1, true) or partName:find("projectile", 1, true) then
+                    knownArcKind = true
+                    break
+                end
+                currentNameNode = currentNameNode.Parent
+                kindSteps = kindSteps + 1
+            end
+            if entry.named and namedProjectile and knownArcKind then
+                gravityMultiplier = State.ProjectileGravityMultiplier
+            end
+            local acceleration = Vector3.new(0, -Workspace.Gravity * gravityMultiplier, 0)
+            local radius = State.ProjectileThreatRadius + math.min(part.Size.Magnitude * 0.25, 2.4)
+            local horizon = State.ProjectilePredictionHorizon
+            local step = State.ProjectilePredictionStep
+            local bestMiss, bestTime, bestVelocity = math.huge, nil, velocity
+
+            -- Immediate overlaps deserve a very short reaction window rather than no reaction.
+            if distance <= radius + 0.25 then
+                bestMiss, bestTime = distance, 0.02
+            elseif acceleration.Magnitude < 0.001 then
+                -- With negligible gravity the relative-motion closest point is analytic and
+                -- cheaper than sampling 16+ future frames for every tracked loose part.
+                local relativeVelocity = velocity - myRoot.AssemblyLinearVelocity
+                local vv = relativeVelocity:Dot(relativeVelocity)
+                local tClosest = 0
+                if vv > 1e-4 then
+                    tClosest = math.clamp(-relativePosition:Dot(relativeVelocity) / vv, 0, horizon)
+                end
+                bestTime = math.max(tClosest, 0.02)
+                bestMiss = (relativePosition + relativeVelocity * tClosest).Magnitude
+                bestVelocity = velocity
+            else
+                local t = step
+                while t <= horizon do
+                    local projectileFuture = pos + velocity * t + acceleration * (0.5 * t * t)
+                    local playerFuture = myRoot.Position + myRoot.AssemblyLinearVelocity * t
+                    local miss = (projectileFuture - playerFuture).Magnitude
+                    if miss < bestMiss then
+                        bestMiss, bestTime = miss, t
+                        bestVelocity = velocity + acceleration * t
+                    end
+                    t = t + step
+                end
+            end
+            if bestTime and bestMiss <= radius then
+                local pathClear = predictedProjectilePathClear(
+                    part, entry, pos, velocity, acceleration, bestTime)
+                if not pathClear then return false end
+                local threatDirection = flat(bestVelocity)
+                if threatDirection.Magnitude < 0.1 then
+                    threatDirection = flat(relativePosition)
+                end
+                return requestSidestep(threatDirection, "predicted projectile", true, false, bestTime)
+            end
+        end
+        return false
+    end
+
+    -- The registry itself is capped, so inspect every retained candidate once. A fixed
+    -- per-kind scan budget could starve unnamed projectiles when there are few named ones.
+    local inspected = 0
+    for part, entry in pairs(ProjectileParts) do
+        if inspect(part, entry) then return end
+        inspected = inspected + 1
+        if inspected >= State.MaxTrackedProjectiles then break end
+    end
+end
+
+local function bindLocalCharacter(character)
+    disconnectList(LocalCharacterConnections)
+    CrouchToken = CrouchToken + 1
+    CrouchController, CrouchButtonRef = nil, nil
+    ParryController, ParryDaggerRef = nil, nil
+    ParryButtonRef = nil
+    LastParryButtonScan = -100
+    ActiveSidestep = nil
+
+    -- Release an input held by the previous life before binding the new character.
+    if CrouchKeyHeld then
+        pcall(function()
+            game:GetService("VirtualInputManager"):SendKeyEvent(false, Enum.KeyCode.C, false, game)
+        end)
+        CrouchKeyHeld = false
+    end
+    CrouchOwned = false
+
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if not humanoid then
+        local ok, found = pcall(function() return character:WaitForChild("Humanoid", 5) end)
+        if ok and found and found:IsA("Humanoid") then humanoid = found end
+    end
+    -- CharacterAdded can overlap a second respawn while WaitForChild is yielding.
+    if ShuttingDown or LocalPlayer.Character ~= character or not humanoid then return end
+
+    local previousHealth = humanoid.Health
+    local connection = humanoid.HealthChanged:Connect(function(health)
+        if health < previousHealth - 0.01 and State.Enabled and State.EmergencyAfterDamage
+            and health > 0 and isSurvivor() then
+            local now = os.clock()
+            if now - LastEmergencyAt > 0.30 then
+                LastEmergencyAt = now
+                local killer, distance = nearestKiller()
+                if killer and distance <= 28 then
+                    local kr, mr = getRoot(killer), getRoot()
+                    if kr and mr then requestSidestep(flat(mr.Position - kr.Position), "post-hit recovery", false, true) end
+                elseif LastProjectileDirection then
+                    requestSidestep(LastProjectileDirection, "post-hit recovery", true)
+                end
+                setStatus("DAMAGE DETECTED · REACTIVE DODGE")
+            end
+        end
+        previousHealth = health
+    end)
+    table.insert(LocalCharacterConnections, connection)
+end
+
+local function updateUI()
+    if UIButtons.Enabled then UIButtons.Enabled.Text = "AUTO DODGE: " .. (State.Enabled and "ON" or "OFF") end
+    if UIButtons.Parry then UIButtons.Parry.Text = "AUTO PARRY: " .. (State.AutoParry and "ON" or "OFF") end
+    if UIButtons.Projectile then UIButtons.Projectile.Text = "PROJECTILE DODGE: " .. (State.ProjectileDodge and "ON" or "OFF") end
+    if UIButtons.Abyss then UIButtons.Abyss.Text = "ABYSS CROUCH: " .. (State.AbyssCrouch and "ON" or "OFF") end
+    refreshBaseStatus(false)
+end
+
+local function createUI()
+    local parent
+    if type(gethui) == "function" then
+        local ok, result = pcall(gethui)
+        if ok and typeof(result) == "Instance" then parent = result end
+    end
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        or LocalPlayer:WaitForChild("PlayerGui", 5)
+    if not parent then parent = playerGui end
+    if not parent then
+        local ok, core = pcall(function() return game:GetService("CoreGui") end)
+        if ok then parent = core end
+    end
+    if not parent then
+        warn("[VD AutoDodge ULTRA v9 RESEARCH] UI parent unavailable; automation will continue without a panel.")
+        return
+    end
+    local old = parent:FindFirstChild("VD_AutoDodge_ULTRA_GUI")
+    if old then pcall(function() old:Destroy() end) end
+
+    local screen = Instance.new("ScreenGui")
+    screen.Name = "VD_AutoDodge_ULTRA_GUI"
+    screen.ResetOnSpawn = false
+    screen.IgnoreGuiInset = true
+    screen.DisplayOrder = 9999
+    screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    local parentOK = pcall(function() screen.Parent = parent end)
+    if not parentOK and playerGui and parent ~= playerGui then
+        parentOK = pcall(function() screen.Parent = playerGui end)
+    end
+    if not parentOK or not screen.Parent then
+        pcall(function() screen:Destroy() end)
+        warn("[VD AutoDodge ULTRA v9 RESEARCH] Could not parent UI; automation will continue without a panel.")
+        return
+    end
+    GUI = screen
+
+    local frame = Instance.new("Frame")
+    frame.Name = "Panel"
+    frame.AnchorPoint = Vector2.new(1, 0.5)
+    frame.Position = UDim2.new(1, -8, 0.56, 0)
+    frame.Size = UDim2.fromOffset(214, 172)
+    frame.BackgroundColor3 = Color3.fromRGB(22, 25, 32)
+    frame.BackgroundTransparency = 0.08
+    frame.BorderSizePixel = 0
+    frame.Parent = screen
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 9)
+    corner.Parent = frame
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(90, 155, 220)
+    stroke.Thickness = 1
+    stroke.Parent = frame
+
+    local title = Instance.new("TextLabel")
+    title.BackgroundTransparency = 1
+    title.Position = UDim2.fromOffset(8, 4)
+    title.Size = UDim2.new(1, -16, 0, 22)
+    title.Font = Enum.Font.GothamBold
+    title.Text = "VD AUTO DODGE ULTRA v9"
+    title.TextColor3 = Color3.fromRGB(235, 242, 255)
+    title.TextSize = 13
+    title.Parent = frame
+
+    local function makeButton(name, text, y, callback)
+        local button = Instance.new("TextButton")
+        button.Name = name
+        button.Position = UDim2.fromOffset(8, y)
+        button.Size = UDim2.new(1, -16, 0, 25)
+        button.BackgroundColor3 = Color3.fromRGB(48, 58, 75)
+        button.BorderSizePixel = 0
+        button.AutoButtonColor = true
+        button.Font = Enum.Font.GothamSemibold
+        button.Text = text
+        button.TextColor3 = Color3.fromRGB(240, 245, 255)
+        button.TextSize = 11
+        button.Parent = frame
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 5)
+        c.Parent = button
+        button.Activated:Connect(callback)
+        return button
+    end
+
+    UIButtons.Enabled = makeButton("Enabled", "AUTO DODGE: ON", 30, function()
+        State.Enabled = not State.Enabled
+        if not State.Enabled then
+            ActiveSidestep = nil
+            CrouchToken = CrouchToken + 1
+            if CrouchOwned then
+                pcall(function() setCrouch(false) end)
+                CrouchOwned = false
+            end
+        end
+        updateUI()
+    end)
+    UIButtons.Parry = makeButton("Parry", "AUTO PARRY: ON", 59, function()
+        State.AutoParry = not State.AutoParry
+        updateUI()
+    end)
+    UIButtons.Projectile = makeButton("Projectile", "PROJECTILE DODGE: ON", 88, function()
+        State.ProjectileDodge = not State.ProjectileDodge
+        if not State.ProjectileDodge then
+            table.clear(ProjectileParts)
+            ProjectileCount = 0
+        else
+            task.spawn(function()
+                local descendants = Workspace:GetDescendants()
+                for index, object in ipairs(descendants) do
+                    if ShuttingDown or not State.ProjectileDodge then break end
+                    registerProjectilePart(object)
+                    if index % 180 == 0 then task.wait() end
+                end
+            end)
+        end
+        updateUI()
+    end)
+    UIButtons.Abyss = makeButton("Abyss", "ABYSS CROUCH: ON", 117, function()
+        State.AbyssCrouch = not State.AbyssCrouch
+        updateUI()
+    end)
+
+    local status = Instance.new("TextLabel")
+    status.Name = "Status"
+    status.BackgroundTransparency = 1
+    status.Position = UDim2.fromOffset(8, 145)
+    status.Size = UDim2.new(1, -16, 0, 22)
+    status.Font = Enum.Font.Gotham
+    status.Text = LastStatusMessage
+    status.TextColor3 = Color3.fromRGB(155, 220, 170)
+    status.TextSize = 9
+    status.TextWrapped = true
+    status.Parent = frame
+    UIStatus = status
+
+    -- Dragging works with mouse or touch without changing game camera settings.
+    local dragging, dragStart, frameStart, dragInput = false, nil, nil, nil
+    title.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            frameStart = frame.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end)
+    title.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end)
+    keepConnection(UserInputService.InputChanged:Connect(function(input)
+        if dragging and input == dragInput and dragStart and frameStart then
+            local delta = input.Position - dragStart
+            frame.Position = UDim2.new(frameStart.X.Scale, frameStart.X.Offset + delta.X,
+                frameStart.Y.Scale, frameStart.Y.Offset + delta.Y)
+        end
+    end))
+    updateUI()
+end
+
+-- Controller loop: only applies a short lateral movement during a high-confidence threat.
+keepConnection(RunService.Heartbeat:Connect(function()
+    if ShuttingDown then return end
+    if ActiveSidestep then
+        local now = os.clock()
+        if now >= ActiveSidestep.endAt or not canAct() then
+            ActiveSidestep = nil
+        else
+            local humanoid = getHumanoid()
+            if humanoid then pcall(function() humanoid:Move(ActiveSidestep.direction, false) end) end
+        end
+    end
+end))
+
+-- Cheap scan of only newly replicated projectile candidates; no full workspace scan per frame.
+local projectileScanAccumulator = 0
+keepConnection(RunService.Heartbeat:Connect(function(dt)
+    if ShuttingDown then return end
+    projectileScanAccumulator = projectileScanAccumulator + dt
+    if projectileScanAccumulator >= State.ProjectileScanInterval then
+        projectileScanAccumulator = 0
+        scanProjectiles()
+    end
+end))
+
+keepConnection(Workspace.DescendantAdded:Connect(function(instance)
+    if ShuttingDown then return end
+    if instance:IsA("BasePart") then watchGlobalAttackHitbox(instance) end
+    if State.ProjectileDodge then registerProjectilePart(instance) end
+end))
+
+task.spawn(function()
+    -- Seed only plausible projectile candidates already present when the script starts.
+    local descendants = Workspace:GetDescendants()
+    for index, object in ipairs(descendants) do
+        if ShuttingDown then break end
+        if object:IsA("BasePart") then watchGlobalAttackHitbox(object) end
+        if State.ProjectileDodge then registerProjectilePart(object) end
+        if index % 180 == 0 then task.wait() end
+    end
+end)
+
+for _, player in ipairs(Players:GetPlayers()) do
+    if player ~= LocalPlayer then watchPlayer(player) end
+end
+keepConnection(Players.PlayerAdded:Connect(function(player)
+    if player ~= LocalPlayer then watchPlayer(player) end
+end))
+keepConnection(Players.PlayerRemoving:Connect(function(player)
+    removePlayerWatch(player)
+    for animator, data in pairs(AnimatorHooks) do
+        if data.player == player then disconnect(data.connection) AnimatorHooks[animator] = nil end
+    end
+end))
+
+keepConnection(LocalPlayer.CharacterAdded:Connect(function(character)
+    task.defer(function()
+        if not ShuttingDown then bindLocalCharacter(character) end
+    end)
+end))
+if getCharacter() then bindLocalCharacter(getCharacter()) end
+attachCombatRemotes()
+-- Some client builds/round states add remotes after LocalScripts initialise. Re-scan only
+-- when a new RemoteEvent appears; CombatRemoteHooks prevents duplicate event connections.
+keepConnection(ReplicatedStorage.DescendantAdded:Connect(function(instance)
+    if not ShuttingDown and instance:IsA("RemoteEvent") then
+        task.defer(attachCombatRemotes)
+    end
+end))
+
+-- Re-scan catches late Team changes, characters whose Animator spawned late, and respawns.
+-- The scan is throttled to 0.6s (not every rendered frame) to keep mobile overhead low.
+local rescanAccumulator = 0
+keepConnection(RunService.Heartbeat:Connect(function(dt)
+    if ShuttingDown then return end
+    rescanAccumulator = rescanAccumulator + dt
+    if rescanAccumulator >= 0.6 then
+        rescanAccumulator = 0
+        if State.Enabled then
+            for _, player in ipairs(Players:GetPlayers()) do
+                if player ~= LocalPlayer and isKillerPlayer(player) then hookKillerCharacter(player) end
+            end
+            for animator, record in pairs(AnimatorHooks) do
+                if not animator.Parent or record.player.Character ~= record.character or not isKillerPlayer(record.player) then
+                    disconnect(record.connection)
+                    AnimatorHooks[animator] = nil
+                end
+            end
+        end
+        refreshBaseStatus(false)
+    end
+end))
+
+function GENV.VD_AutoDodge_ULTRA_Stop()
+    if ShuttingDown then return end
+    ShuttingDown = true
+    State.Enabled = false
+    ActiveSidestep = nil
+    CrouchToken = CrouchToken + 1
+    table.clear(ProjectileParts)
+    ProjectileCount = 0
+    if CrouchKeyHeld then
+        pcall(function() game:GetService("VirtualInputManager"):SendKeyEvent(false, Enum.KeyCode.C, false, game) end)
+        CrouchKeyHeld = false
+    end
+    if CrouchOwned then
+        pcall(function() setCrouch(false) end)
+        CrouchOwned = false
+    end
+    disconnectList(Connections)
+    disconnectList(LocalCharacterConnections)
+    for track, connection in pairs(TrackStoppedHooks) do
+        disconnect(connection)
+        TrackStoppedHooks[track] = nil
+        TrackSeen[track] = nil
+    end
+    for player in pairs(PlayerConnections) do removePlayerWatch(player) end
+    for animator, record in pairs(AnimatorHooks) do disconnect(record.connection) AnimatorHooks[animator] = nil end
+    for character, localConnections in pairs(KillerModelHooks) do
+        disconnectList(localConnections)
+        KillerModelHooks[character] = nil
+    end
+    for part, globalConnections in pairs(GlobalHitboxHooks) do
+        disconnectList(globalConnections)
+        GlobalHitboxHooks[part] = nil
+        HitboxPartsWatched[part] = nil
+    end
+    for part, partConnections in pairs(AttackPartHooks) do
+        disconnectList(partConnections)
+        AttackPartHooks[part] = nil
+        HitboxPartsWatched[part] = nil
+    end
+    if GUI then pcall(function() GUI:Destroy() end) GUI = nil end
+    ParryButtonRef = nil
+    GENV.VD_AutoDodge_ULTRA = nil
+    GENV.VD_AutoDodge_ULTRA_Stop = nil
+    GENV.VD_ULTRA = nil
+    GENV.VD_ULTRA_Stop = nil
+end
+
+GENV.VD_AutoDodge_ULTRA = {
+    State = State,
+    Stop = GENV.VD_AutoDodge_ULTRA_Stop,
+}
+GENV.VD_ULTRA = GENV.VD_AutoDodge_ULTRA
+GENV.VD_ULTRA_Stop = GENV.VD_AutoDodge_ULTRA_Stop
+
+local uiOK, uiError = pcall(createUI)
+if not uiOK then
+    warn("[VD AutoDodge ULTRA v9 RESEARCH] Panel could not be created; automation remains active: " .. tostring(uiError))
+end
+print("[VD AutoDodge ULTRA v9 RESEARCH] Loaded " .. BUILD_VERSION .. ". Smoothed pose sampling, stale late-cue guard, occlusion-aware projectile interception, multi-candidate sidesteps, independent parry feedback discovery, and respawn-safe cleanup enabled; no invulnerability is claimed.")
